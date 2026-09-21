@@ -1,0 +1,27 @@
+//
+//  Constants.swift
+//  AnywhereIP
+//
+//  Created by NodePassProject on 9/20/26.
+//
+
+enum Constants {
+    static let maximumSegmentSize: UInt16 = 1460
+    static let window: UInt32 = 64 * 1460
+    static let sendBufferSize: UInt32 = 64 * 1460
+    static let sendQueueLimit = 256
+    static let receiveScale: UInt8 = 7
+    static let initialMSS: UInt16 = 536
+    static let initialRTO: Int16 = 5
+    static let maximumRetransmissions: UInt8 = 8
+    static let synReceivedTimeout: UInt32 = 100
+    static let finWait2Timeout: UInt32 = 100
+    static let lastAckTimeout: UInt32 = 10
+    static let timeWaitTimeout: UInt32 = 10
+    static let windowUpdateThreshold: UInt32 = 11680
+    static let resetWindow: UInt16 = 730
+    static let hopLimit: UInt8 = 255
+    static let mtu = 1500
+    static let retransmissionBackoff: [Int16] = [1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7]
+    static let persistBackoff: [UInt8] = [3, 6, 12, 24, 48, 96, 120]
+}

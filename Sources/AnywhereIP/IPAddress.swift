@@ -17,18 +17,18 @@ public enum IPAddress: Hashable, Sendable {
             rawValue = value
         }
 
-        public init(bytes pointer: UnsafeRawPointer) {
+        init(bytes pointer: UnsafeRawPointer) {
             rawValue = UInt32(bigEndian: pointer.loadUnaligned(as: UInt32.self))
         }
 
-        public func write(to pointer: UnsafeMutableRawPointer) {
+        func write(to pointer: UnsafeMutableRawPointer) {
             pointer.storeBytes(of: rawValue.bigEndian, as: UInt32.self)
         }
 
-        public var isUnspecified: Bool { rawValue == 0 }
-        public var isBroadcast: Bool { rawValue == .max }
-        public var isMulticast: Bool { rawValue >> 28 == 0xE }
-        public var isLoopback: Bool { rawValue >> 24 == 127 }
+        var isUnspecified: Bool { rawValue == 0 }
+        var isBroadcast: Bool { rawValue == .max }
+        var isMulticast: Bool { rawValue >> 28 == 0xE }
+        var isLoopback: Bool { rawValue >> 24 == 127 }
     }
 
     public struct V6: Hashable, Sendable {
@@ -40,21 +40,21 @@ public enum IPAddress: Hashable, Sendable {
             self.low = low
         }
 
-        public init(bytes pointer: UnsafeRawPointer) {
+        init(bytes pointer: UnsafeRawPointer) {
             high = UInt64(bigEndian: pointer.loadUnaligned(as: UInt64.self))
             low = UInt64(bigEndian: pointer.loadUnaligned(fromByteOffset: 8, as: UInt64.self))
         }
 
-        public func write(to pointer: UnsafeMutableRawPointer) {
+        func write(to pointer: UnsafeMutableRawPointer) {
             pointer.storeBytes(of: high.bigEndian, as: UInt64.self)
             pointer.storeBytes(of: low.bigEndian, toByteOffset: 8, as: UInt64.self)
         }
 
-        public var isUnspecified: Bool { high == 0 && low == 0 }
-        public var isLoopback: Bool { high == 0 && low == 1 }
-        public var isMulticast: Bool { high >> 56 == 0xFF }
-        public var isLinkLocal: Bool { high >> 54 == 0x3FA }
-        public var isIPv4Mapped: Bool { high == 0 && low >> 32 == 0xFFFF }
+        var isUnspecified: Bool { high == 0 && low == 0 }
+        var isLoopback: Bool { high == 0 && low == 1 }
+        var isMulticast: Bool { high >> 56 == 0xFF }
+        var isLinkLocal: Bool { high >> 54 == 0x3FA }
+        var isIPv4Mapped: Bool { high == 0 && low >> 32 == 0xFFFF }
     }
 
     case v4(V4)
@@ -114,21 +114,5 @@ extension IPAddress: CustomStringConvertible {
             let tail = hex[(bestStart + bestLength)...].joined(separator: ":")
             return "\(head)::\(tail)"
         }
-    }
-}
-
-public struct IPEndpoint: Hashable, Sendable {
-    public var address: IPAddress
-    public var port: UInt16
-
-    public init(address: IPAddress, port: UInt16) {
-        self.address = address
-        self.port = port
-    }
-}
-
-extension IPEndpoint: CustomStringConvertible {
-    public var description: String {
-        address.isIPv6 ? "[\(address)]:\(port)" : "\(address):\(port)"
     }
 }

@@ -18,11 +18,7 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "AnywhereIP",
-            swiftSettings: [
-                .enableUpcomingFeature("ApproachableConcurrency"),
-                .unsafeFlags(["-enforce-exclusivity=unchecked"], .when(configuration: .release)),
-            ]
+            name: "AnywhereIP"
         ),
     ]
 )

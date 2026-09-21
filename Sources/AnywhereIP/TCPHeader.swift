@@ -5,32 +5,32 @@
 //  Created by NodePassProject on 9/20/26.
 //
 
-public struct TCPHeader: Hashable, Sendable {
-    public struct Flags: OptionSet, Hashable, Sendable {
-        public let rawValue: UInt8
+struct TCPHeader: Hashable, Sendable {
+    struct Flags: OptionSet, Hashable, Sendable {
+        let rawValue: UInt8
 
-        public init(rawValue: UInt8) {
+        init(rawValue: UInt8) {
             self.rawValue = rawValue
         }
 
-        public static let fin = Flags(rawValue: 0x01)
-        public static let syn = Flags(rawValue: 0x02)
-        public static let rst = Flags(rawValue: 0x04)
-        public static let psh = Flags(rawValue: 0x08)
-        public static let ack = Flags(rawValue: 0x10)
-        public static let urg = Flags(rawValue: 0x20)
+        static let fin = Flags(rawValue: 0x01)
+        static let syn = Flags(rawValue: 0x02)
+        static let rst = Flags(rawValue: 0x04)
+        static let psh = Flags(rawValue: 0x08)
+        static let ack = Flags(rawValue: 0x10)
+        static let urg = Flags(rawValue: 0x20)
     }
 
-    public struct Options: Hashable, Sendable {
-        public var maximumSegmentSize: UInt16?
-        public var windowScale: UInt8?
+    struct Options: Hashable, Sendable {
+        var maximumSegmentSize: UInt16?
+        var windowScale: UInt8?
 
-        public init(maximumSegmentSize: UInt16? = nil, windowScale: UInt8? = nil) {
+        init(maximumSegmentSize: UInt16? = nil, windowScale: UInt8? = nil) {
             self.maximumSegmentSize = maximumSegmentSize
             self.windowScale = windowScale
         }
 
-        public init(parsing bytes: UnsafeRawBufferPointer) {
+        init(parsing bytes: UnsafeRawBufferPointer) {
             var index = 0
             while index < bytes.count {
                 let kind = bytes[index]
@@ -56,11 +56,11 @@ public struct TCPHeader: Hashable, Sendable {
             }
         }
 
-        public var encodedLength: Int {
+        var encodedLength: Int {
             (maximumSegmentSize == nil ? 0 : 4) + (windowScale == nil ? 0 : 4)
         }
 
-        public func write(to bytes: UnsafeMutableRawBufferPointer) {
+        func write(to bytes: UnsafeMutableRawBufferPointer) {
             var offset = 0
             if let maximumSegmentSize {
                 bytes[offset] = 2
@@ -77,19 +77,19 @@ public struct TCPHeader: Hashable, Sendable {
         }
     }
 
-    public static let length = 20
+    static let length = 20
 
-    public var sourcePort: UInt16
-    public var destinationPort: UInt16
-    public var sequenceNumber: UInt32
-    public var acknowledgmentNumber: UInt32
-    public var dataOffset: Int
-    public var flags: Flags
-    public var window: UInt16
-    public var checksum: UInt16
-    public var urgentPointer: UInt16
+    var sourcePort: UInt16
+    var destinationPort: UInt16
+    var sequenceNumber: UInt32
+    var acknowledgmentNumber: UInt32
+    var dataOffset: Int
+    var flags: Flags
+    var window: UInt16
+    var checksum: UInt16
+    var urgentPointer: UInt16
 
-    public init(
+    init(
         sourcePort: UInt16,
         destinationPort: UInt16,
         sequenceNumber: UInt32,
@@ -111,7 +111,7 @@ public struct TCPHeader: Hashable, Sendable {
         self.urgentPointer = urgentPointer
     }
 
-    public init?(parsing bytes: UnsafeRawBufferPointer) {
+    init?(parsing bytes: UnsafeRawBufferPointer) {
         guard bytes.count >= Self.length, let base = bytes.baseAddress else { return nil }
         let dataOffset = Int(base.load(fromByteOffset: 12, as: UInt8.self) >> 4) * 4
         guard dataOffset >= Self.length, dataOffset <= bytes.count else { return nil }
@@ -126,7 +126,7 @@ public struct TCPHeader: Hashable, Sendable {
         urgentPointer = UInt16(bigEndian: base.loadUnaligned(fromByteOffset: 18, as: UInt16.self))
     }
 
-    public func write(to bytes: UnsafeMutableRawBufferPointer) {
+    func write(to bytes: UnsafeMutableRawBufferPointer) {
         precondition(bytes.count >= Self.length)
         let base = bytes.baseAddress!
         base.storeBytes(of: sourcePort.bigEndian, as: UInt16.self)
@@ -138,19 +138,5 @@ public struct TCPHeader: Hashable, Sendable {
         base.storeBytes(of: window.bigEndian, toByteOffset: 14, as: UInt16.self)
         base.storeBytes(of: checksum.bigEndian, toByteOffset: 16, as: UInt16.self)
         base.storeBytes(of: urgentPointer.bigEndian, toByteOffset: 18, as: UInt16.self)
-    }
-}
-
-enum TCPSequence {
-    static func lessThan(_ a: UInt32, _ b: UInt32) -> Bool {
-        (a &- b) & 0x8000_0000 != 0
-    }
-
-    static func lessThanOrEqual(_ a: UInt32, _ b: UInt32) -> Bool {
-        !lessThan(b, a)
-    }
-
-    static func between(_ value: UInt32, _ low: UInt32, _ high: UInt32) -> Bool {
-        lessThanOrEqual(low, value) && lessThanOrEqual(value, high)
     }
 }

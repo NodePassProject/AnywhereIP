@@ -5,17 +5,17 @@
 //  Created by NodePassProject on 9/20/26.
 //
 
-public struct InternetChecksum: Sendable {
+struct InternetChecksum: Sendable {
     private var sum: UInt32 = 0
     private var isOddOffset = false
 
-    public init() {}
+    init() {}
 
-    public mutating func update(bufferPointer bytes: UnsafeRawBufferPointer) {
+    mutating func update(bufferPointer bytes: UnsafeRawBufferPointer) {
         update(partialSum: Self.partialSum(of: bytes), byteCount: bytes.count)
     }
 
-    public mutating func update(partialSum: UInt16, byteCount: Int) {
+    mutating func update(partialSum: UInt16, byteCount: Int) {
         guard byteCount > 0 else { return }
         sum = UInt32(Self.fold(UInt64(sum) &+ UInt64(isOddOffset ? partialSum.byteSwapped : partialSum)))
         if byteCount & 1 == 1 {
@@ -23,11 +23,11 @@ public struct InternetChecksum: Sendable {
         }
     }
 
-    public func finalize() -> UInt16 {
+    func finalize() -> UInt16 {
         ~UInt16(truncatingIfNeeded: sum)
     }
 
-    public static func partialSum(of bytes: UnsafeRawBufferPointer) -> UInt16 {
+    static func partialSum(of bytes: UnsafeRawBufferPointer) -> UInt16 {
         guard let base = bytes.baseAddress, !bytes.isEmpty else { return 0 }
         return foldedSum(of: base, count: bytes.count)
     }
@@ -81,7 +81,7 @@ public struct InternetChecksum: Sendable {
 }
 
 extension InternetChecksum {
-    public mutating func update(pseudoHeaderFor source: IPAddress, destination: IPAddress, protocol: UInt8, length: Int) {
+    mutating func update(pseudoHeaderFor source: IPAddress, destination: IPAddress, protocol: UInt8, length: Int) {
         withUnsafeTemporaryAllocation(byteCount: 40, alignment: 8) { buffer in
             let base = buffer.baseAddress!
             source.write(to: base)

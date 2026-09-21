@@ -5,18 +5,20 @@
 //  Created by NodePassProject on 9/20/26.
 //
 
-public struct IPv6Header: Hashable, Sendable {
-    public static let length = 40
+struct IPv6Header: Hashable, Sendable {
+    static let length = 40
 
-    public var trafficClass: UInt8
-    public var flowLabel: UInt32
-    public var payloadLength: Int
-    public var nextHeader: UInt8
-    public var hopLimit: UInt8
-    public var source: IPAddress.V6
-    public var destination: IPAddress.V6
+    var trafficClass: UInt8
+    var flowLabel: UInt32
+    var payloadLength: Int
+    var nextHeader: UInt8
+    var hopLimit: UInt8
+    var source: IPAddress.V6
+    var destination: IPAddress.V6
+    
+    var totalLength: Int { Self.length + payloadLength }
 
-    public init(
+    init(
         payloadLength: Int,
         nextHeader: UInt8,
         hopLimit: UInt8,
@@ -34,7 +36,7 @@ public struct IPv6Header: Hashable, Sendable {
         self.destination = destination
     }
 
-    public init?(parsing bytes: UnsafeRawBufferPointer) {
+    init?(parsing bytes: UnsafeRawBufferPointer) {
         guard bytes.count >= Self.length, let base = bytes.baseAddress else { return nil }
         let first = UInt32(bigEndian: base.loadUnaligned(as: UInt32.self))
         guard first >> 28 == 6 else { return nil }
@@ -49,9 +51,7 @@ public struct IPv6Header: Hashable, Sendable {
         destination = IPAddress.V6(bytes: base + 24)
     }
 
-    public var totalLength: Int { Self.length + payloadLength }
-
-    public func write(to bytes: UnsafeMutableRawBufferPointer) {
+    func write(to bytes: UnsafeMutableRawBufferPointer) {
         precondition(bytes.count >= Self.length)
         let base = bytes.baseAddress!
         let first = UInt32(6) << 28 | UInt32(trafficClass) << 20 | flowLabel & 0xF_FFFF
@@ -64,20 +64,20 @@ public struct IPv6Header: Hashable, Sendable {
     }
 }
 
-public struct IPv6Payload: Hashable, Sendable {
-    public var nextHeader: UInt8
-    public var offset: Int
-    public var nextHeaderFieldOffset: Int
-}
-
-public enum IPv6PayloadLocation: Hashable, Sendable {
-    case found(IPv6Payload)
-    case dropped
-    case parameterProblem(code: UInt8, pointer: UInt32)
-}
-
 extension IPv6Header {
-    public func locatePayload(in packet: UnsafeRawBufferPointer) -> IPv6PayloadLocation {
+    struct IPv6Payload: Hashable, Sendable {
+        public var nextHeader: UInt8
+        public var offset: Int
+        public var nextHeaderFieldOffset: Int
+    }
+
+    enum IPv6PayloadLocation: Hashable, Sendable {
+        case found(IPv6Payload)
+        case dropped
+        case parameterProblem(code: UInt8, pointer: UInt32)
+    }
+    
+    func locatePayload(in packet: UnsafeRawBufferPointer) -> IPv6PayloadLocation {
         var nextHeader = self.nextHeader
         var nextHeaderFieldOffset = 6
         var offset = Self.length

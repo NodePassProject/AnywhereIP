@@ -1,12 +1,35 @@
 //
-//  IPLayer.swift
+//  PacketDecoder.swift
 //  AnywhereIP
 //
 //  Created by NodePassProject on 9/20/26.
 //
 
-extension IPStack {
-    func receive(_ packet: UnsafeRawBufferPointer) {
+import Foundation
+
+struct PacketDecoder {
+    var tcp: InboundTCP?
+    var output: [OutboundPacket] = []
+    private var input = Data()
+    private var inputBase: UnsafeRawPointer?
+
+    mutating func decode(_ packet: Data) {
+        input = packet
+        packet.withUnsafeBytes { bytes in
+            inputBase = bytes.baseAddress
+            receive(bytes)
+        }
+        inputBase = nil
+    }
+
+    mutating func deliverTCP(_ segment: UnsafeRawBufferPointer, source: IPAddress, destination: IPAddress) {
+        guard let header = TCPHeader(parsing: segment), let base = segment.baseAddress, let inputBase else { return }
+        let offset = inputBase.distance(to: base) + header.dataOffset
+        let start = input.startIndex + offset
+        tcp = InboundTCP(key: ConnectionKey(remote: IPEndpoint(address: source, port: header.sourcePort), local: IPEndpoint(address: destination, port: header.destinationPort)), header: header, options: Data(segment[TCPHeader.length..<header.dataOffset]), payload: input[start..<(start + segment.count - header.dataOffset)])
+    }
+    
+    mutating func receive(_ packet: UnsafeRawBufferPointer) {
         guard let first = packet.first else { return }
         switch first >> 4 {
         case 4: receiveIPv4(packet)
@@ -15,12 +38,7 @@ extension IPStack {
         }
     }
 
-    func nextIPv4Identification() -> UInt16 {
-        defer { ipv4Identification &+= 1 }
-        return ipv4Identification
-    }
-
-    private func receiveIPv4(_ packet: UnsafeRawBufferPointer) {
+    private mutating func receiveIPv4(_ packet: UnsafeRawBufferPointer) {
         guard let header = IPv4Header(parsing: packet), !header.hasOptions, !header.isFragment,
               isRoutable(header.source), isRoutable(header.destination) else { return }
         let datagram = UnsafeRawBufferPointer(rebasing: packet[..<header.totalLength])
@@ -36,7 +54,7 @@ extension IPStack {
         !address.isUnspecified && !address.isBroadcast && !address.isMulticast && !address.isLoopback
     }
 
-    private func receiveIPv6(_ packet: UnsafeRawBufferPointer) {
+    private mutating func receiveIPv6(_ packet: UnsafeRawBufferPointer) {
         guard let header = IPv6Header(parsing: packet),
               !header.source.isUnspecified, !header.source.isMulticast, !header.source.isIPv4Mapped,
               !header.destination.isMulticast, !header.destination.isIPv4Mapped else { return }
@@ -57,7 +75,7 @@ extension IPStack {
         }
     }
 
-    private func replyToEchoRequest(in datagram: UnsafeRawBufferPointer, header: IPv4Header, payload: UnsafeRawBufferPointer) {
+    private mutating func replyToEchoRequest(in datagram: UnsafeRawBufferPointer, header: IPv4Header, payload: UnsafeRawBufferPointer) {
         guard payload.count >= 8, payload[0] == 8 else { return }
         send(byteCount: datagram.count, isIPv6: false) { reply in
             reply.copyMemory(from: datagram)
@@ -71,7 +89,7 @@ extension IPStack {
         }
     }
 
-    private func sendProtocolUnreachable(for datagram: UnsafeRawBufferPointer, header: IPv4Header) {
+    private mutating func sendProtocolUnreachable(for datagram: UnsafeRawBufferPointer, header: IPv4Header) {
         let quoted = min(datagram.count, IPv4Header.length + 8)
         let length = IPv4Header.length + 8 + quoted
         send(byteCount: length, isIPv6: false) { reply in
@@ -81,7 +99,7 @@ extension IPStack {
                 protocol: 1,
                 source: header.destination,
                 destination: header.source,
-                identification: nextIPv4Identification()
+                identification: PacketIdentification.next()
             ).write(to: reply)
             let message = UnsafeMutableRawBufferPointer(rebasing: reply[IPv4Header.length...])
             message.storeBytes(of: UInt64(0), as: UInt64.self)
@@ -92,7 +110,7 @@ extension IPStack {
         }
     }
 
-    private func replyToEchoRequest(in datagram: UnsafeRawBufferPointer, header: IPv6Header, payload: UnsafeRawBufferPointer) {
+    private mutating func replyToEchoRequest(in datagram: UnsafeRawBufferPointer, header: IPv6Header, payload: UnsafeRawBufferPointer) {
         guard payload.count >= 8, payload[0] == 128 else { return }
         send(byteCount: IPv6Header.length + payload.count, isIPv6: true) { reply in
             IPv6Header(
@@ -111,7 +129,7 @@ extension IPStack {
         }
     }
 
-    private func sendParameterProblem(for datagram: UnsafeRawBufferPointer, header: IPv6Header, code: UInt8, pointer: UInt32) {
+    private mutating func sendParameterProblem(for datagram: UnsafeRawBufferPointer, header: IPv6Header, code: UInt8, pointer: UInt32) {
         let quoted = min(datagram.count, 1280 - IPv6Header.length - 8)
         send(byteCount: IPv6Header.length + 8 + quoted, isIPv6: true) { reply in
             IPv6Header(
@@ -152,15 +170,11 @@ extension IPStack {
         buffer.storeBytes(of: checksum.finalize(), toByteOffset: offset, as: UInt16.self)
     }
 
-    func send(byteCount: Int, isIPv6: Bool, _ fill: (UnsafeMutableRawBufferPointer) -> Void) {
+    mutating func send(byteCount: Int, isIPv6: Bool, _ fill: (UnsafeMutableRawBufferPointer) -> Void) {
         let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: byteCount, alignment: 8)
         fill(buffer)
-        let packet = OutboundPacket(
-            bytes: UnsafeRawBufferPointer(buffer),
-            isIPv6: isIPv6,
-            releaseContext: buffer.baseAddress,
-            release: { $0?.deallocate() }
-        )
-        outputHandler?(packet)
+        let packet = OutboundPacket(data: Data(buffer), isIPv6: isIPv6)
+        buffer.deallocate()
+        output.append(packet)
     }
 }

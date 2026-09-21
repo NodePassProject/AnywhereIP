@@ -5,20 +5,23 @@
 //  Created by NodePassProject on 9/20/26.
 //
 
-public struct IPv4Header: Hashable, Sendable {
-    public static let length = 20
+struct IPv4Header: Hashable, Sendable {
+    static let length = 20
 
-    public var headerLength: Int
-    public var typeOfService: UInt8
-    public var totalLength: Int
-    public var identification: UInt16
-    public var fragmentField: UInt16
-    public var timeToLive: UInt8
-    public var `protocol`: UInt8
-    public var source: IPAddress.V4
-    public var destination: IPAddress.V4
+    var headerLength: Int
+    var typeOfService: UInt8
+    var totalLength: Int
+    var identification: UInt16
+    var fragmentField: UInt16
+    var timeToLive: UInt8
+    var `protocol`: UInt8
+    var source: IPAddress.V4
+    var destination: IPAddress.V4
+    
+    var isFragment: Bool { fragmentField & 0x3FFF != 0 }
+    var hasOptions: Bool { headerLength > Self.length }
 
-    public init(
+    init(
         totalLength: Int,
         timeToLive: UInt8,
         protocol: UInt8,
@@ -39,7 +42,7 @@ public struct IPv4Header: Hashable, Sendable {
         self.destination = destination
     }
 
-    public init?(parsing bytes: UnsafeRawBufferPointer) {
+    init?(parsing bytes: UnsafeRawBufferPointer) {
         guard bytes.count >= Self.length, let base = bytes.baseAddress else { return nil }
         let versionAndLength = base.load(as: UInt8.self)
         guard versionAndLength >> 4 == 4 else { return nil }
@@ -57,10 +60,7 @@ public struct IPv4Header: Hashable, Sendable {
         destination = IPAddress.V4(bytes: base + 16)
     }
 
-    public var isFragment: Bool { fragmentField & 0x3FFF != 0 }
-    public var hasOptions: Bool { headerLength > Self.length }
-
-    public func write(to bytes: UnsafeMutableRawBufferPointer) {
+    func write(to bytes: UnsafeMutableRawBufferPointer) {
         precondition(bytes.count >= Self.length)
         let base = bytes.baseAddress!
         base.storeBytes(of: 0x45, as: UInt8.self)
