@@ -44,7 +44,7 @@ public final class IPStack: Sendable {
     private let configuration: Configuration
     private let outputHandler: @Sendable ([OutboundPacket]) -> Void
     private let acceptHandler: @Sendable (PendingConnection) -> Void
-    private let synFilter: @Sendable (IPEndpoint, IPEndpoint) -> Bool
+    private let synFilter: @Sendable (IPEndpoint, IPEndpoint) -> AcceptVerdict
     private let strayFilter: @Sendable (IPEndpoint, IPEndpoint) -> Bool
     private let clockOrigin = ContinuousClock.now
     private let initialSequence = Atomic<UInt32>(UInt32.random(in: .min ... .max))
@@ -65,7 +65,7 @@ public final class IPStack: Sendable {
         configuration: Configuration = Configuration(),
         output: @escaping @Sendable ([OutboundPacket]) -> Void,
         accept: @escaping @Sendable (PendingConnection) -> Void,
-        synFilter: @escaping @Sendable (IPEndpoint, IPEndpoint) -> Bool = { _, _ in true },
+        synFilter: @escaping @Sendable (IPEndpoint, IPEndpoint) -> AcceptVerdict = { _, _ in .accept },
         strayFilter: @escaping @Sendable (IPEndpoint, IPEndpoint) -> Bool = { _, _ in true }
     ) {
         precondition(configuration.maximumConnections > 0 && configuration.pendingSendBytes > 0 && configuration.parallelism > 0)
@@ -135,18 +135,20 @@ public final class IPStack: Sendable {
         if header.flags.contains(.rst) { return }
         if header.flags.contains(.ack) {
             guard strayFilter(packet.key.remote, packet.key.local), isLive(generation) else { return }
-            let context = Context(initialSequenceNumber: 0, ticks: ticks)
-            let length = UInt32(packet.payload.count) + (header.flags.contains(.syn) || header.flags.contains(.fin) ? 1 : 0)
-            context.sendReset(from: packet.key.local, to: packet.key.remote,
-                              sequenceNumber: header.acknowledgmentNumber,
-                              acknowledgmentNumber: header.sequenceNumber &+ length)
-            let packets = context.effects.compactMap { effect -> OutboundPacket? in
-                if case .packet(let packet) = effect { packet } else { nil }
-            }
-            outputHandler(packets)
+            reset(packet, sequenceNumber: header.acknowledgmentNumber)
             return
         }
-        guard header.flags.contains(.syn), synFilter(packet.key.remote, packet.key.local) else { return }
+        guard header.flags.contains(.syn) else { return }
+        switch synFilter(packet.key.remote, packet.key.local) {
+        case .accept:
+            break
+        case .drop:
+            return
+        case .reset:
+            guard isLive(generation) else { return }
+            reset(packet, sequenceNumber: 0)
+            return
+        }
         if connectionCount >= configuration.maximumConnections {
             let candidates = connections()
             if let timeWait = candidates.first(where: { $0.isTimeWait }) {
@@ -167,7 +169,9 @@ public final class IPStack: Sendable {
             let connection = Stream(
                 packet: packet,
                 initialSequenceNumber: initialSequence.wrappingAdd(64001, ordering: .relaxed).oldValue,
-                ticks: ticks, generation: generation, pendingLimit: configuration.pendingSendBytes,
+                ticks: ticks,
+                generation: generation,
+                pendingLimit: configuration.pendingSendBytes,
                 output: { [weak self] packets in self?.outputHandler(packets) },
                 ready: { [weak self] pending in
                     guard let self else { pending.reject(); return }
@@ -180,6 +184,22 @@ public final class IPStack: Sendable {
         }
         if connection != nil { timerDriver.withLock { $0.continuation }?.yield(()) }
         connection?.input(packet)
+    }
+
+    private func reset(_ packet: InboundTCP, sequenceNumber: UInt32) {
+        let header = packet.header
+        let context = Context(initialSequenceNumber: 0, ticks: ticks)
+        let length = UInt32(packet.payload.count) + (header.flags.contains(.syn) || header.flags.contains(.fin) ? 1 : 0)
+        context.sendReset(
+            from: packet.key.local,
+            to: packet.key.remote,
+            sequenceNumber: sequenceNumber,
+            acknowledgmentNumber: header.sequenceNumber &+ length
+        )
+        let packets = context.effects.compactMap { effect -> OutboundPacket? in
+            if case .packet(let packet) = effect { packet } else { nil }
+        }
+        outputHandler(packets)
     }
 
     private func deliverBatch(_ packets: [InboundTCP], generation: UInt64) {
