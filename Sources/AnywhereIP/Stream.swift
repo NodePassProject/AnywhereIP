@@ -70,8 +70,13 @@ public final class Stream: Sendable {
         }
 
         mutating func harvest() {
-            let effects = core.stack.effects
-            core.stack.effects.removeAll(keepingCapacity: true)
+            guard !core.stack.effects.isEmpty else { return }
+            var effects = core.stack.effects
+            core.stack.effects = []
+            defer {
+                effects.removeAll(keepingCapacity: true)
+                if core.stack.effects.isEmpty { core.stack.effects = effects }
+            }
             for effect in effects {
                 switch effect {
                 case .packet(let packet):
@@ -199,12 +204,11 @@ public final class Stream: Sendable {
     }
     
     private func drainPublications() {
+        var batch: [Publication] = []
         while true {
-            let batch = state.withLock { state -> [Publication] in
-                let batch = state.publications
-                state.publications.removeAll(keepingCapacity: true)
+            state.withLock { state in
+                swap(&batch, &state.publications)
                 if batch.isEmpty { state.draining = false }
-                return batch
             }
             if batch.isEmpty { return }
             var packets: [OutboundPacket] = []
@@ -219,6 +223,7 @@ public final class Stream: Sendable {
                 }
             }
             if !packets.isEmpty { output(packets) }
+            batch.removeAll(keepingCapacity: true)
         }
     }
 
@@ -342,7 +347,7 @@ public final class Stream: Sendable {
                 let count = min(data.count - offset, pendingLimit - state.pendingBytes)
                 if count > 0 {
                     let start = data.startIndex + offset
-                    state.pending.append(Data(data[start..<(start + count)]))
+                    state.pending.append(data[start..<(start + count)])
                     state.pendingBytes += count
                     state.pump()
                     return .written(count)

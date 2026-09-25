@@ -101,15 +101,23 @@ public final class IPStack: Sendable {
         }
         guard isLive(generation) else { return }
         if !control.isEmpty { outputHandler(control) }
+        if partitions.count(where: { !$0.isEmpty }) <= 1 {
+            for partition in partitions where !partition.isEmpty {
+                deliverPartition(partition, generation: generation)
+            }
+            return
+        }
         await withTaskGroup(of: Void.self) { group in
             for partition in partitions where !partition.isEmpty {
-                group.addTask {
-                    for (_, packets) in partition {
-                        guard !Task.isCancelled, self.isLive(generation) else { return }
-                        self.deliverBatch(packets, generation: generation)
-                    }
-                }
+                group.addTask { self.deliverPartition(partition, generation: generation) }
             }
+        }
+    }
+
+    private func deliverPartition(_ partition: [ConnectionKey: [InboundTCP]], generation: UInt64) {
+        for (_, packets) in partition {
+            guard !Task.isCancelled, isLive(generation) else { return }
+            deliverBatch(packets, generation: generation)
         }
     }
 
