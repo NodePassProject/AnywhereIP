@@ -15,4 +15,10 @@ public struct OutboundPacket: Sendable {
         self.data = data
         self.isIPv6 = isIPv6
     }
+
+    init(byteCount: Int, isIPv6: Bool, _ fill: (UnsafeMutableRawBufferPointer) -> Void) {
+        var data = Data(count: byteCount)
+        data.withUnsafeMutableBytes(fill)
+        self.init(data: data, isIPv6: isIPv6)
+    }
 }

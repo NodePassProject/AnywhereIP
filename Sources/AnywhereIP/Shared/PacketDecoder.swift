@@ -9,9 +9,15 @@ import Foundation
 
 struct PacketDecoder {
     var tcp: InboundTCP?
+    var udp: InboundDatagram?
     var output: [OutboundPacket] = []
+    private let decodesUDP: Bool
     private var input = Data()
     private var inputBase: UnsafeRawPointer?
+
+    init(decodesUDP: Bool) {
+        self.decodesUDP = decodesUDP
+    }
 
     mutating func decode(_ packet: Data) {
         input = packet
@@ -28,7 +34,20 @@ struct PacketDecoder {
         let start = input.startIndex + offset
         tcp = InboundTCP(key: ConnectionKey(remote: IPEndpoint(address: source, port: header.sourcePort), local: IPEndpoint(address: destination, port: header.destinationPort)), header: header, options: Data(segment[TCPHeader.length..<header.dataOffset]), payload: input[start..<(start + segment.count - header.dataOffset)])
     }
-    
+
+    mutating func deliverUDP(_ segment: UnsafeRawBufferPointer, in datagram: UnsafeRawBufferPointer, source: IPAddress, destination: IPAddress) {
+        guard let header = UDPHeader(parsing: segment), let base = segment.baseAddress,
+              let datagramBase = datagram.baseAddress, let inputBase else { return }
+        let packetStart = input.startIndex + inputBase.distance(to: datagramBase)
+        let start = input.startIndex + inputBase.distance(to: base) + UDPHeader.length
+        udp = InboundDatagram(
+            source: IPEndpoint(address: source, port: header.sourcePort),
+            destination: IPEndpoint(address: destination, port: header.destinationPort),
+            payload: input[start..<(start + header.totalLength - UDPHeader.length)],
+            packet: input[packetStart..<(packetStart + datagram.count)]
+        )
+    }
+
     mutating func receive(_ packet: UnsafeRawBufferPointer) {
         guard let first = packet.first else { return }
         switch first >> 4 {
@@ -45,6 +64,7 @@ struct PacketDecoder {
         let payload = UnsafeRawBufferPointer(rebasing: datagram[IPv4Header.length...])
         switch header.protocol {
         case 6: deliverTCP(payload, source: .v4(header.source), destination: .v4(header.destination))
+        case 17 where decodesUDP: deliverUDP(payload, in: datagram, source: .v4(header.source), destination: .v4(header.destination))
         case 1: replyToEchoRequest(in: datagram, header: header, payload: payload)
         default: sendProtocolUnreachable(for: datagram, header: header)
         }
@@ -68,6 +88,7 @@ struct PacketDecoder {
             let bytes = UnsafeRawBufferPointer(rebasing: datagram[payload.offset...])
             switch payload.nextHeader {
             case 6: deliverTCP(bytes, source: .v6(header.source), destination: .v6(header.destination))
+            case 17 where decodesUDP: deliverUDP(bytes, in: datagram, source: .v6(header.source), destination: .v6(header.destination))
             case 58: replyToEchoRequest(in: datagram, header: header, payload: bytes)
             case 59: return
             default: sendParameterProblem(for: datagram, header: header, code: 1, pointer: UInt32(payload.nextHeaderFieldOffset))
@@ -85,29 +106,12 @@ struct PacketDecoder {
             replyHeader.timeToLive = 255
             replyHeader.write(to: reply)
             reply[IPv4Header.length] = 0
-            Self.storeChecksum(in: reply, from: IPv4Header.length, at: IPv4Header.length + 2)
+            ICMPMessage.storeChecksum(in: reply, from: IPv4Header.length, at: IPv4Header.length + 2)
         }
     }
 
     private mutating func sendProtocolUnreachable(for datagram: UnsafeRawBufferPointer, header: IPv4Header) {
-        let quoted = min(datagram.count, IPv4Header.length + 8)
-        let length = IPv4Header.length + 8 + quoted
-        send(byteCount: length, isIPv6: false) { reply in
-            IPv4Header(
-                totalLength: length,
-                timeToLive: 255,
-                protocol: 1,
-                source: header.destination,
-                destination: header.source,
-                identification: PacketIdentification.next()
-            ).write(to: reply)
-            let message = UnsafeMutableRawBufferPointer(rebasing: reply[IPv4Header.length...])
-            message.storeBytes(of: UInt64(0), as: UInt64.self)
-            message[0] = 3
-            message[1] = 2
-            UnsafeMutableRawBufferPointer(rebasing: message[8...]).copyMemory(from: UnsafeRawBufferPointer(rebasing: datagram[..<quoted]))
-            Self.storeChecksum(in: reply, from: IPv4Header.length, at: IPv4Header.length + 2)
-        }
+        output.append(ICMPMessage.error(type: 3, code: 2, quoting: datagram, from: header.destination, to: header.source))
     }
 
     private mutating func replyToEchoRequest(in datagram: UnsafeRawBufferPointer, header: IPv6Header, payload: UnsafeRawBufferPointer) {
@@ -122,7 +126,7 @@ struct PacketDecoder {
             ).write(to: reply)
             UnsafeMutableRawBufferPointer(rebasing: reply[IPv6Header.length...]).copyMemory(from: payload)
             reply[IPv6Header.length] = 129
-            Self.storeChecksum(
+            ICMPMessage.storeChecksum(
                 in: reply, from: IPv6Header.length, at: IPv6Header.length + 2,
                 pseudoHeaderFor: .v6(header.destination), destination: .v6(header.source), protocol: 58
             )
@@ -130,51 +134,10 @@ struct PacketDecoder {
     }
 
     private mutating func sendParameterProblem(for datagram: UnsafeRawBufferPointer, header: IPv6Header, code: UInt8, pointer: UInt32) {
-        let quoted = min(datagram.count, 1280 - IPv6Header.length - 8)
-        send(byteCount: IPv6Header.length + 8 + quoted, isIPv6: true) { reply in
-            IPv6Header(
-                payloadLength: 8 + quoted,
-                nextHeader: 58,
-                hopLimit: 255,
-                source: header.destination,
-                destination: header.source
-            ).write(to: reply)
-            let message = UnsafeMutableRawBufferPointer(rebasing: reply[IPv6Header.length...])
-            message[0] = 4
-            message[1] = code
-            message[2] = 0
-            message[3] = 0
-            message.storeBytes(of: pointer.bigEndian, toByteOffset: 4, as: UInt32.self)
-            UnsafeMutableRawBufferPointer(rebasing: message[8...]).copyMemory(from: UnsafeRawBufferPointer(rebasing: datagram[..<quoted]))
-            Self.storeChecksum(
-                in: reply, from: IPv6Header.length, at: IPv6Header.length + 2,
-                pseudoHeaderFor: .v6(header.destination), destination: .v6(header.source), protocol: 58
-            )
-        }
-    }
-
-    private static func storeChecksum(
-        in buffer: UnsafeMutableRawBufferPointer,
-        from start: Int,
-        at offset: Int,
-        pseudoHeaderFor source: IPAddress? = nil,
-        destination: IPAddress? = nil,
-        protocol: UInt8 = 0
-    ) {
-        buffer.storeBytes(of: UInt16(0), toByteOffset: offset, as: UInt16.self)
-        var checksum = InternetChecksum()
-        if let source, let destination {
-            checksum.update(pseudoHeaderFor: source, destination: destination, protocol: `protocol`, length: buffer.count - start)
-        }
-        checksum.update(bufferPointer: UnsafeRawBufferPointer(rebasing: UnsafeRawBufferPointer(buffer)[start...]))
-        buffer.storeBytes(of: checksum.finalize(), toByteOffset: offset, as: UInt16.self)
+        output.append(ICMPMessage.error(type: 4, code: code, parameter: pointer, quoting: datagram, from: header.destination, to: header.source))
     }
 
     mutating func send(byteCount: Int, isIPv6: Bool, _ fill: (UnsafeMutableRawBufferPointer) -> Void) {
-        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: byteCount, alignment: 8)
-        fill(buffer)
-        let packet = OutboundPacket(data: Data(buffer), isIPv6: isIPv6)
-        buffer.deallocate()
-        output.append(packet)
+        output.append(OutboundPacket(byteCount: byteCount, isIPv6: isIPv6, fill))
     }
 }

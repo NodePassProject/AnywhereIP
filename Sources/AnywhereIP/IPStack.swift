@@ -48,6 +48,7 @@ public final class IPStack: Sendable {
     private let configuration: Configuration
     private let outputHandler: @Sendable ([OutboundPacket]) -> Void
     private let acceptHandler: @Sendable (PendingConnection) -> Void
+    private let datagramHandler: (@Sendable ([InboundDatagram]) -> Void)?
     private let synFilter: @Sendable (IPEndpoint, IPEndpoint) -> AcceptVerdict
     private let strayFilter: @Sendable (IPEndpoint, IPEndpoint) -> Bool
     private let clock = TickClock()
@@ -65,6 +66,7 @@ public final class IPStack: Sendable {
         configuration: Configuration = Configuration(),
         output: @escaping @Sendable ([OutboundPacket]) -> Void,
         accept: @escaping @Sendable (PendingConnection) -> Void,
+        datagrams: (@Sendable ([InboundDatagram]) -> Void)? = nil,
         synFilter: @escaping @Sendable (IPEndpoint, IPEndpoint) -> AcceptVerdict = { _, _ in .accept },
         strayFilter: @escaping @Sendable (IPEndpoint, IPEndpoint) -> Bool = { _, _ in true }
     ) {
@@ -72,6 +74,7 @@ public final class IPStack: Sendable {
         self.configuration = configuration
         outputHandler = output
         acceptHandler = accept
+        datagramHandler = datagrams
         self.synFilter = synFilter
         self.strayFilter = strayFilter
         shards = (0..<max(16, configuration.parallelism * 4)).map { _ in Shard() }
@@ -79,10 +82,11 @@ public final class IPStack: Sendable {
     
     public func input(_ packet: Data) {
         guard let generation = liveGeneration() else { return }
-        var decoder = PacketDecoder()
+        var decoder = PacketDecoder(decodesUDP: datagramHandler != nil)
         decoder.decode(packet)
         guard isLive(generation) else { return }
         if !decoder.output.isEmpty { outputHandler(decoder.output) }
+        if let udp = decoder.udp { datagramHandler?([udp]) }
         if let tcp = decoder.tcp { deliver(tcp, generation: generation) }
     }
     
@@ -90,10 +94,13 @@ public final class IPStack: Sendable {
         guard let generation = liveGeneration(), !packets.isEmpty else { return }
         var partitions = Array(repeating: [ConnectionKey: [InboundTCP]](), count: configuration.parallelism)
         var control: [OutboundPacket] = []
+        var datagrams: [InboundDatagram] = []
+        let decodesUDP = datagramHandler != nil
         for packet in packets {
-            var decoder = PacketDecoder()
+            var decoder = PacketDecoder(decodesUDP: decodesUDP)
             decoder.decode(packet)
             control.append(contentsOf: decoder.output)
+            if let udp = decoder.udp { datagrams.append(udp) }
             if let tcp = decoder.tcp {
                 let index = Int(tcp.key.fingerprint % UInt64(partitions.count))
                 partitions[index][tcp.key, default: []].append(tcp)
@@ -101,6 +108,7 @@ public final class IPStack: Sendable {
         }
         guard isLive(generation) else { return }
         if !control.isEmpty { outputHandler(control) }
+        if !datagrams.isEmpty { datagramHandler?(datagrams) }
         if partitions.count(where: { !$0.isEmpty }) <= 1 {
             for partition in partitions where !partition.isEmpty {
                 deliverPartition(partition, generation: generation)

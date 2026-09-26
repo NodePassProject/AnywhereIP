@@ -101,5 +101,4 @@ struct Segment: Equatable {
     var tcpLength: UInt32 {
         UInt32(length) + (flags.contains(.syn) || flags.contains(.fin) ? 1 : 0)
     }
-
 }
