@@ -42,6 +42,7 @@ public final class IPStack: Sendable {
     public static let tickInterval: Duration = TickClock.interval
     private static let timerTolerance: Duration = .milliseconds(50)
     private static let sleeping: UInt64 = 1 << 32
+    private static let parallelPartitionLoad = 16
     
     private let admission = Mutex(Admission())
     private let shards: [Shard]
@@ -93,6 +94,7 @@ public final class IPStack: Sendable {
     @concurrent public func inputBatch(_ packets: [Data]) async {
         guard let generation = liveGeneration(), !packets.isEmpty else { return }
         var partitions = Array(repeating: [ConnectionKey: [InboundTCP]](), count: configuration.parallelism)
+        var loads = Array(repeating: 0, count: configuration.parallelism)
         var control: [OutboundPacket] = []
         var datagrams: [InboundDatagram] = []
         let decodesUDP = datagramHandler != nil
@@ -104,20 +106,26 @@ public final class IPStack: Sendable {
             if let tcp = decoder.tcp {
                 let index = Int(tcp.key.fingerprint % UInt64(partitions.count))
                 partitions[index][tcp.key, default: []].append(tcp)
+                loads[index] += 1
             }
         }
         guard isLive(generation) else { return }
         if !control.isEmpty { outputHandler(control) }
         if !datagrams.isEmpty { datagramHandler?(datagrams) }
-        if partitions.count(where: { !$0.isEmpty }) <= 1 {
+        guard let inline = loads.firstIndex(where: { $0 >= Self.parallelPartitionLoad }),
+              loads.count(where: { $0 >= Self.parallelPartitionLoad }) > 1 else {
             for partition in partitions where !partition.isEmpty {
                 deliverPartition(partition, generation: generation)
             }
             return
         }
         await withTaskGroup(of: Void.self) { group in
-            for partition in partitions where !partition.isEmpty {
+            for index in partitions.indices where index != inline && loads[index] >= Self.parallelPartitionLoad {
+                let partition = partitions[index]
                 group.addTask { self.deliverPartition(partition, generation: generation) }
+            }
+            for index in partitions.indices where index == inline || (loads[index] < Self.parallelPartitionLoad && loads[index] > 0) {
+                deliverPartition(partitions[index], generation: generation)
             }
         }
     }
