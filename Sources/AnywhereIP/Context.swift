@@ -30,6 +30,10 @@ final class Context {
         self.ticks = ticks
     }
 
+    func advance(to ticks: UInt32) {
+        if Sequence.lessThan(self.ticks, ticks) { self.ticks = ticks }
+    }
+
     func withPayload(_ data: Data, _ body: (UnsafeRawBufferPointer) -> Void) {
         input = data
         defer { input = nil; inputBase = nil }

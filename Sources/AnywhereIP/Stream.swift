@@ -57,6 +57,17 @@ public final class Stream: Sendable {
             }
         }
 
+        var deadline: UInt32? {
+            var deadline = core.nextDeadline
+            if case .pending = admission, core.state != .timeWait, core.state != .closed {
+                let expiry = TickClock.align(admissionTick, after: Constants.synReceivedTimeout + 1)
+                if deadline.map({ Sequence.lessThan(expiry, $0) }) ?? true { deadline = expiry }
+            }
+            guard let deadline else { return nil }
+            let now = core.stack.ticks
+            return Sequence.lessThan(now, deadline) ? deadline : now &+ 1
+        }
+
         mutating func wakeReaders() {
             if let readWaiter { publications.append(.wake(readWaiter)) }
             readWaiter = nil
@@ -161,24 +172,31 @@ public final class Stream: Sendable {
     let key: ConnectionKey
     let generation: UInt64
     private let state: Mutex<State>
+    private let clock: TickClock
+    private let scheduled = Atomic<UInt32>(0)
+    private let lingering = Atomic<Bool>(false)
     private let pendingLimit: Int
     private let output: @Sendable ([OutboundPacket]) -> Void
     private let ready: @Sendable (PendingConnection) -> Void
     private let removed: @Sendable (Stream) -> Void
+    private let schedule: @Sendable (UInt32) -> Void
     
     public var isAttached: Bool { state.withLock { !$0.ended && !$0.closing } }
     public var sendBufferSpace: Int { state.withLock { $0.core.sendBufferSpace } }
     var isTimeWait: Bool { state.withLock { $0.core.state == .timeWait } }
+    var isLingering: Bool { lingering.load(ordering: .relaxed) }
+    var scheduledDeadline: UInt32 { scheduled.load(ordering: .sequentiallyConsistent) }
 
     init(
         packet: InboundTCP,
         initialSequenceNumber: UInt32,
-        ticks: UInt32,
+        clock: TickClock,
         generation: UInt64,
         pendingLimit: Int,
         output: @escaping @Sendable ([OutboundPacket]) -> Void,
         ready: @escaping @Sendable (PendingConnection) -> Void,
-        removed: @escaping @Sendable (Stream) -> Void
+        removed: @escaping @Sendable (Stream) -> Void,
+        schedule: @escaping @Sendable (UInt32) -> Void
     ) {
         key = packet.key
         self.generation = generation
@@ -188,18 +206,25 @@ public final class Stream: Sendable {
         self.output = output
         self.ready = ready
         self.removed = removed
-        state = Mutex(State(packet: packet, initialSequenceNumber: initialSequenceNumber, ticks: ticks))
+        self.schedule = schedule
+        self.clock = clock
+        state = Mutex(State(packet: packet, initialSequenceNumber: initialSequenceNumber, ticks: clock.now))
     }
 
     private func update<T: Sendable>(_ body: (inout State) -> T) -> T {
-        let (result, drain) = state.withLock { state in
+        let (result, drain, previous, deadline) = state.withLock { state in
+            state.core.stack.advance(to: clock.now)
             let result = body(&state)
             state.harvest()
             let drain = !state.draining && !state.publications.isEmpty
             if drain { state.draining = true }
-            return (result, drain)
+            let deadline = state.deadline.map { $0 == 0 ? 1 : $0 } ?? 0
+            let previous = scheduled.exchange(deadline, ordering: .sequentiallyConsistent)
+            lingering.store(state.core.state == .timeWait || state.core.state == .closed, ordering: .relaxed)
+            return (result, drain, previous, deadline)
         }
         if drain { drainPublications() }
+        if deadline != 0, previous == 0 || Sequence.lessThan(deadline, previous) { schedule(deadline) }
         return result
     }
     
@@ -262,28 +287,26 @@ public final class Stream: Sendable {
         }
     }
 
-    func advance(to ticks: UInt32) -> Bool {
+    func expire() -> UInt32 {
         update { state in
-            let elapsed = ticks &- state.core.stack.ticks
-            if elapsed > 0, elapsed < 0x80000000, state.core.state != .closed {
-                state.core.stack.ticks = ticks
-                if state.core.state == .timeWait {
-                    if ticks &- state.core.tmr > Constants.timeWaitTimeout {
-                        state.core.state = .closed
-                        state.publications.append(.remove)
-                        state.finish(nil)
-                    }
-                } else if case .pending = state.admission,
-                          ticks &- state.admissionTick > Constants.synReceivedTimeout {
-                    state.core.terminate(sendingReset: true, error: .aborted)
-                } else {
-                    state.core.slowTick(ticks: ticks, elapsed: elapsed)
-                    state.harvest()
-                    state.pump()
+            let ticks = state.core.stack.ticks
+            guard state.core.state != .closed else { return }
+            if state.core.state == .timeWait {
+                if ticks &- state.core.tmr > Constants.timeWaitTimeout {
+                    state.core.state = .closed
+                    state.publications.append(.remove)
+                    state.finish(nil)
                 }
+            } else if case .pending = state.admission,
+                      ticks &- state.admissionTick > Constants.synReceivedTimeout {
+                state.core.terminate(sendingReset: true, error: .aborted)
+            } else {
+                state.core.slowTick(ticks: ticks)
+                state.harvest()
+                state.pump()
             }
-            return state.core.state != .timeWait && state.core.state != .closed
         }
+        return scheduledDeadline
     }
 
     func resolve(_ verdict: AcceptVerdict) -> Bool {

@@ -53,7 +53,7 @@ final class ControlBlock {
     var rcvWnd: UInt32 = 0xFFFF
     var rcvAnnWnd: UInt32 = 0xFFFF
     var rcvAnnRightEdge: UInt32
-    var rtime: Int16 = -1
+    var rtoStart: UInt32?
     var rto = Constants.initialRTO
     var sa: Int16 = 0
     var sv = Constants.initialRTO
@@ -74,7 +74,7 @@ final class ControlBlock {
     var unsent = SegmentList()
     var unacked = SegmentList()
     var unsentOversize = 0
-    var persistCount: UInt8 = 0
+    var persistStart: UInt32 = 0
     var persistBackoff: UInt8 = 0
     var persistProbes: UInt8 = 0
     var sndScale: UInt8 = 0
@@ -293,7 +293,7 @@ final class ControlBlock {
             arena.recycle(segment)
         }
         unsentOversize = 0
-        rtime = -1
+        rtoStart = nil
     }
 
     private func enterTimeWait() {
@@ -332,8 +332,8 @@ final class ControlBlock {
     }
 
     private func transmit(_ segment: Segment, _ stack: Context) {
-        if rtime < 0 {
-            rtime = 0
+        if rtoStart == nil {
+            rtoStart = stack.ticks
         }
         if rttest == 0, Sequence.lessThanOrEqual(sndNxt, segment.sequenceNumber) {
             rttest = stack.ticks
@@ -355,7 +355,7 @@ final class ControlBlock {
         }
         if first.sequenceNumber &- lastAck &+ UInt32(first.length) > wnd {
             if unacked.isEmpty, persistBackoff == 0 {
-                persistCount = 0
+                persistStart = stack.ticks
                 persistBackoff = 1
                 persistProbes = 0
             }
@@ -412,7 +412,7 @@ final class ControlBlock {
         guard !unacked.isEmpty, !flags.contains(.inFastRecovery) else { return }
         if moveFirstUnackedToUnsent() {
             flags.insert(.inFastRecovery)
-            rtime = 0
+            rtoStart = stack.ticks
         }
     }
 
@@ -467,48 +467,37 @@ final class ControlBlock {
         stack.transmit(probe, from: destination, to: source, acknowledgmentNumber: rcvNxt, window: announcedWindow)
     }
 
-    func slowTick(ticks: UInt32, elapsed: UInt32 = 1) {
+    func slowTick(ticks: UInt32) {
         var remove = false
         if nrtx >= Constants.maximumRetransmissions {
             remove = true
         } else if persistBackoff > 0 {
             if persistProbes >= Constants.maximumRetransmissions {
                 remove = true
-            } else {
-                let backoff = Constants.persistBackoff[Int(persistBackoff) - 1]
-                if persistCount < backoff {
-                    persistCount = UInt8(min(Int(backoff), Int(persistCount) + Int(elapsed)))
-                }
-                if persistCount >= backoff {
-                    var nextSlot = true
-                    if sndWnd == 0 {
-                        zeroWindowProbe()
-                    } else if splitFirstUnsent(at: Int(min(sndWnd, 0xFFFF))) {
-                        output()
-                        nextSlot = false
-                    }
-                    if nextSlot {
-                        persistCount = 0
-                        if persistBackoff < UInt8(Constants.persistBackoff.count) {
-                            persistBackoff += 1
-                        }
-                    }
-                }
-            }
-        } else {
-            if rtime >= 0, rtime < Int16.max {
-                rtime = Int16(min(Int(Int16.max), Int(rtime) + Int(elapsed)))
-            }
-            if rtime >= rto {
-                if prepareRetransmission() || (unacked.isEmpty && !unsent.isEmpty) {
-                    let backoff = Constants.retransmissionBackoff[min(Int(nrtx), Constants.retransmissionBackoff.count - 1)]
-                    rto = Int16(min(Int32((sa >> 3) &+ sv) << Int32(backoff), Int32(Int16.max)))
-                    rtime = 0
-                    if nrtx < UInt8.max {
-                        nrtx += 1
-                    }
+            } else if ticks &- persistStart >= UInt32(Constants.persistBackoff[Int(persistBackoff) - 1]) {
+                var nextSlot = true
+                if sndWnd == 0 {
+                    zeroWindowProbe()
+                } else if splitFirstUnsent(at: Int(min(sndWnd, 0xFFFF))) {
                     output()
+                    nextSlot = false
                 }
+                if nextSlot {
+                    persistStart = ticks
+                    if persistBackoff < UInt8(Constants.persistBackoff.count) {
+                        persistBackoff += 1
+                    }
+                }
+            }
+        } else if let start = rtoStart, Int(ticks &- start) >= Int(rto) {
+            if prepareRetransmission() || (unacked.isEmpty && !unsent.isEmpty) {
+                let backoff = Constants.retransmissionBackoff[min(Int(nrtx), Constants.retransmissionBackoff.count - 1)]
+                rto = Int16(min(Int32((sa >> 3) &+ sv) << Int32(backoff), Int32(Int16.max)))
+                rtoStart = ticks
+                if nrtx < UInt8.max {
+                    nrtx += 1
+                }
+                output()
             }
         }
         if state == .finWait2, flags.contains(.receiveClosed), ticks &- tmr > Constants.finWait2Timeout {
@@ -525,6 +514,41 @@ final class ControlBlock {
         } else {
             output()
         }
+    }
+
+    var nextDeadline: UInt32? {
+        var deadline: UInt32?
+        func include(_ start: UInt32, after interval: UInt32) {
+            let candidate = TickClock.align(start, after: interval)
+            if deadline.map({ Sequence.lessThan(candidate, $0) }) ?? true { deadline = candidate }
+        }
+        switch state {
+        case .closed:
+            return nil
+        case .timeWait:
+            include(tmr, after: Constants.timeWaitTimeout + 1)
+            return deadline
+        case .synReceived:
+            include(tmr, after: Constants.synReceivedTimeout + 1)
+        case .finWait2 where flags.contains(.receiveClosed):
+            include(tmr, after: Constants.finWait2Timeout + 1)
+        case .lastAck:
+            include(tmr, after: Constants.lastAckTimeout + 1)
+        default:
+            break
+        }
+        if nrtx >= Constants.maximumRetransmissions {
+            include(stack.ticks, after: 0)
+        } else if persistBackoff > 0 {
+            if persistProbes >= Constants.maximumRetransmissions {
+                include(stack.ticks, after: 0)
+            } else {
+                include(persistStart, after: UInt32(Constants.persistBackoff[Int(persistBackoff) - 1]))
+            }
+        } else if let rtoStart, !unacked.isEmpty || !unsent.isEmpty {
+            include(rtoStart, after: UInt32(max(0, rto)))
+        }
+        return deadline
     }
 
     func timeWaitInput(header: TCPHeader, payloadCount: Int) {
@@ -722,7 +746,7 @@ final class ControlBlock {
                 sndWl2 = ackno
             }
             if Sequence.lessThanOrEqual(ackno, lastAck) {
-                if tcpLength == 0, sndWl2 &+ sndWnd == rightWindowEdge, rtime >= 0, lastAck == ackno {
+                if tcpLength == 0, sndWl2 &+ sndWnd == rightWindowEdge, rtoStart != nil, lastAck == ackno {
                     if dupacks < UInt8.max {
                         dupacks += 1
                     }
@@ -743,7 +767,7 @@ final class ControlBlock {
                 if unsent.isEmpty {
                     unsentOversize = 0
                 }
-                rtime = unacked.isEmpty ? -1 : 0
+                rtoStart = unacked.isEmpty ? nil : stack.ticks
                 sndBuf += acked
                 if flags.contains(.rto), (unacked.first ?? unsent.first).map({ Sequence.lessThanOrEqual(rtoEnd, $0.sequenceNumber) }) ?? true {
                     flags.remove(.rto)

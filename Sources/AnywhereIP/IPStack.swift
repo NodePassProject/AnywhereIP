@@ -34,10 +34,14 @@ public final class IPStack: Sendable {
     
     private struct TimerDriver {
         var running = false
-        var continuation: AsyncStream<Void>.Continuation?
+        var pending = false
+        var finished = false
+        var waiter: CheckedContinuation<Bool, Never>?
     }
     
-    public static let tickInterval: Duration = .milliseconds(100)
+    public static let tickInterval: Duration = TickClock.interval
+    private static let timerTolerance: Duration = .milliseconds(50)
+    private static let sleeping: UInt64 = 1 << 32
     
     private let admission = Mutex(Admission())
     private let shards: [Shard]
@@ -46,20 +50,16 @@ public final class IPStack: Sendable {
     private let acceptHandler: @Sendable (PendingConnection) -> Void
     private let synFilter: @Sendable (IPEndpoint, IPEndpoint) -> AcceptVerdict
     private let strayFilter: @Sendable (IPEndpoint, IPEndpoint) -> Bool
-    private let clockOrigin = ContinuousClock.now
+    private let clock = TickClock()
     private let initialSequence = Atomic<UInt32>(UInt32.random(in: .min ... .max))
     private let timerDriver = Mutex(TimerDriver())
+    private let armed = Atomic<UInt64>(0)
     
     public var isIdle: Bool { admission.withLock { $0.count == 0 } }
     public var connectionCount: Int { admission.withLock { $0.count } }
     public var activeConnectionCount: Int { connections().reduce(0) { $0 + ($1.isTimeWait ? 0 : 1) } }
     
-    private var ticks: UInt32 {
-        let duration = clockOrigin.duration(to: .now)
-        guard duration > .zero else { return 0 }
-        let parts = duration.components
-        return UInt32(truncatingIfNeeded: parts.seconds &* 5 &+ parts.attoseconds / 200_000_000_000_000_000)
-    }
+    private var ticks: UInt32 { clock.now }
 
     public init(
         configuration: Configuration = Configuration(),
@@ -177,7 +177,7 @@ public final class IPStack: Sendable {
             let connection = Stream(
                 packet: packet,
                 initialSequenceNumber: initialSequence.wrappingAdd(64001, ordering: .relaxed).oldValue,
-                ticks: ticks,
+                clock: clock,
                 generation: generation,
                 pendingLimit: configuration.pendingSendBytes,
                 output: { [weak self] packets in self?.outputHandler(packets) },
@@ -185,12 +185,12 @@ public final class IPStack: Sendable {
                     guard let self else { pending.reject(); return }
                     self.acceptHandler(pending)
                 },
-                removed: { [weak self] in self?.remove($0) }
+                removed: { [weak self] in self?.remove($0) },
+                schedule: { [weak self] in self?.schedule($0) }
             )
             entries[packet.key] = connection
             return connection
         }
-        if connection != nil { timerDriver.withLock { $0.continuation }?.yield(()) }
         connection?.input(packet)
     }
 
@@ -242,44 +242,91 @@ public final class IPStack: Sendable {
     }
     
     @discardableResult public func tick() -> Int {
-        let now = ticks
+        expire(at: ticks).active
+    }
+
+    private func expire(at now: UInt32) -> (active: Int, deadline: UInt32?) {
         var active = 0
+        var next: UInt32?
         for connection in connections() {
-            if connection.advance(to: now) { active += 1 }
+            var deadline = connection.scheduledDeadline
+            if deadline != 0, !Sequence.lessThan(now, deadline) { deadline = connection.expire() }
+            if !connection.isLingering { active += 1 }
+            if deadline != 0, next.map({ Sequence.lessThan(deadline, $0) }) ?? true { next = deadline }
         }
-        return active
+        return (active, next)
+    }
+
+    private func schedule(_ deadline: UInt32) {
+        let armed = self.armed.load(ordering: .sequentiallyConsistent)
+        guard armed < Self.sleeping || Sequence.lessThan(deadline, UInt32(truncatingIfNeeded: armed)) else { return }
+        let waiter = timerDriver.withLock { driver -> CheckedContinuation<Bool, Never>? in
+            guard let waiter = driver.waiter else { driver.pending = true; return nil }
+            driver.waiter = nil
+            return waiter
+        }
+        waiter?.resume(returning: true)
+    }
+
+    private func waitForSchedule() async -> Bool {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let immediate = timerDriver.withLock { driver -> Bool? in
+                    if driver.finished || Task.isCancelled { return false }
+                    if driver.pending { driver.pending = false; return true }
+                    driver.waiter = continuation
+                    return nil
+                }
+                if let immediate { continuation.resume(returning: immediate) }
+            }
+        } onCancel: {
+            timerDriver.withLock { driver in
+                defer { driver.waiter = nil }
+                return driver.waiter
+            }?.resume(returning: false)
+        }
+    }
+
+    private func sleep(until deadline: UInt32) async -> Bool {
+        let instant = clock.instant(of: deadline)
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask { (try? await Task.sleep(until: instant, tolerance: Self.timerTolerance, clock: .continuous)) != nil }
+            group.addTask { await self.waitForSchedule() }
+            defer { group.cancelAll() }
+            return await group.next() ?? false
+        }
+    }
+
+    private func finishTimer() {
+        timerDriver.withLock { driver in
+            driver.finished = true
+            defer { driver.waiter = nil }
+            return driver.waiter
+        }?.resume(returning: false)
     }
     
     @concurrent public func runTimer(_ onTick: @escaping @Sendable (Int) -> Void = { _ in }) async {
-        let activity = timerDriver.withLock { driver -> AsyncStream<Void>? in
-            guard !driver.running else { return nil }
-            let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let claimed = timerDriver.withLock { driver -> Bool in
+            guard !driver.running else { return false }
             driver.running = true
-            driver.continuation = continuation
-            return stream
+            return true
         }
-        guard let activity else { return }
+        guard claimed else { return }
         defer {
-            let continuation = timerDriver.withLock { driver in
-                let continuation = driver.continuation
-                driver.running = false
-                driver.continuation = nil
-                return continuation
-            }
-            continuation?.finish()
+            armed.store(0, ordering: .sequentiallyConsistent)
+            timerDriver.withLock { $0.running = false }
         }
-        var events = activity.makeAsyncIterator()
         while !Task.isCancelled {
             guard liveGeneration() != nil else { return }
-            if isIdle {
-                onTick(0)
-                guard await events.next() != nil else { return }
-                continue
+            armed.store(0, ordering: .sequentiallyConsistent)
+            let (active, deadline) = expire(at: ticks)
+            onTick(active)
+            if let deadline {
+                armed.store(Self.sleeping | UInt64(deadline), ordering: .sequentiallyConsistent)
+                guard await sleep(until: deadline) else { return }
+            } else {
+                guard await waitForSchedule() else { return }
             }
-            do { try await Task.sleep(for: Self.tickInterval, tolerance: .milliseconds(10)) }
-            catch { return }
-            guard liveGeneration() != nil else { return }
-            onTick(tick())
         }
     }
     
@@ -293,12 +340,12 @@ public final class IPStack: Sendable {
 
     public func shutdown() {
         admission.withLock { $0.closed = true; $0.generation &+= 1 }
-        timerDriver.withLock { $0.continuation }?.finish()
+        finishTimer()
         for connection in connections() { connection.cancel() }
     }
 
     deinit {
-        timerDriver.withLock { $0.continuation }?.finish()
+        finishTimer()
         for shard in shards {
             let live = shard.entries.withLock { entries in
                 let live = Array(entries.values)

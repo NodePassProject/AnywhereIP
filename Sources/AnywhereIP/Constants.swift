@@ -18,6 +18,8 @@ enum Constants {
     static let finWait2Timeout: UInt32 = 100
     static let lastAckTimeout: UInt32 = 10
     static let timeWaitTimeout: UInt32 = 10
+    static let coarseTimerThreshold: UInt32 = 10
+    static let coarseTimerGranularity: UInt32 = 5
     static let windowUpdateThreshold: UInt32 = 11680
     static let resetWindow: UInt16 = 730
     static let hopLimit: UInt8 = 255
