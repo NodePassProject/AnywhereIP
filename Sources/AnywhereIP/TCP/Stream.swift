@@ -10,16 +10,64 @@ import Synchronization
 
 public final class Stream: Sendable {
     private enum Admission { case handshake, pending, accepted, rejected }
-    
+
     private enum Publication: Sendable {
         case output(OutboundPacket)
         case ready
         case remove
-        case wake(AsyncStream<Void>.Continuation)
+        case wake(CheckedContinuation<Void, Never>)
     }
-    
+
+    private enum Role { case reader, writer, acknowledger }
+
+    private struct Waiter {
+        private enum Wakeup {
+            case idle
+            case signaled
+            case parked(CheckedContinuation<Void, Never>)
+        }
+
+        private(set) var isBusy = false
+        private var wakeup = Wakeup.idle
+
+        mutating func hold(_ busy: Bool) {
+            isBusy = busy
+            if busy { wakeup = .idle }
+        }
+
+        mutating func signal() -> CheckedContinuation<Void, Never>? {
+            defer { wakeup = .signaled }
+            guard case .parked(let continuation) = wakeup else { return nil }
+            return continuation
+        }
+
+        mutating func park(_ continuation: CheckedContinuation<Void, Never>) -> Bool {
+            guard case .signaled = wakeup else {
+                wakeup = .parked(continuation)
+                return true
+            }
+            wakeup = .idle
+            return false
+        }
+    }
+
+    private enum Outcome<Value: Sendable>: Sendable {
+        case finished(Value)
+        case failure(ConnectionError)
+        case wait
+
+        var isWaiting: Bool {
+            switch self {
+            case .wait: true
+            case .finished, .failure: false
+            }
+        }
+    }
+
     private struct State {
         let core: ControlBlock
+        let pendingLimit: Int
+        let writeThreshold: Int
         var started = false
         var admission = Admission.handshake
         var admissionTick: UInt32 = 0
@@ -35,16 +83,14 @@ public final class Stream: Sendable {
         var pending: [Data] = []
         var pendingOffset = 0
         var pendingBytes = 0
-        var reading = false
-        var writing = false
-        var waitingForACK = false
-        var readWaiter: AsyncStream<Void>.Continuation?
-        var writeWaiter: AsyncStream<Void>.Continuation?
-        var ackWaiter: AsyncStream<Void>.Continuation?
+        var reader = Waiter()
+        var writer = Waiter()
+        var acknowledger = Waiter()
+        var reclaimableSince: UInt32?
         var publications: [Publication] = []
         var draining = false
 
-        init(packet: InboundTCP, initialSequenceNumber: UInt32, ticks: UInt32) {
+        init(packet: InboundTCP, initialSequenceNumber: UInt32, ticks: UInt32, pendingLimit: Int) {
             let context = Context(initialSequenceNumber: initialSequenceNumber, ticks: ticks)
             core = packet.options.withUnsafeBytes {
                 ControlBlock(
@@ -55,6 +101,8 @@ public final class Stream: Sendable {
                     options: $0
                 )
             }
+            self.pendingLimit = pendingLimit
+            writeThreshold = max(1, pendingLimit / 2)
         }
 
         var deadline: UInt32? {
@@ -63,21 +111,50 @@ public final class Stream: Sendable {
                 let expiry = TickClock.align(admissionTick, after: Constants.synReceivedTimeout + 1)
                 if deadline.map({ Sequence.lessThan(expiry, $0) }) ?? true { deadline = expiry }
             }
+            if let reclaimableSince {
+                let reclaim = TickClock.align(reclaimableSince, after: Constants.arenaReclaimDelay)
+                if deadline.map({ Sequence.lessThan(reclaim, $0) }) ?? true { deadline = reclaim }
+            }
             guard let deadline else { return nil }
             let now = core.stack.ticks
             return Sequence.lessThan(now, deadline) ? deadline : now &+ 1
         }
 
+        mutating func withWaiter<T>(_ role: Role, _ body: (inout Waiter) -> T) -> T {
+            switch role {
+            case .reader: body(&reader)
+            case .writer: body(&writer)
+            case .acknowledger: body(&acknowledger)
+            }
+        }
+
         mutating func wakeReaders() {
-            if let readWaiter { publications.append(.wake(readWaiter)) }
-            readWaiter = nil
+            if let continuation = reader.signal() { publications.append(.wake(continuation)) }
         }
 
         mutating func wakeWriters() {
-            if let writeWaiter { publications.append(.wake(writeWaiter)) }
-            writeWaiter = nil
-            if let ackWaiter { publications.append(.wake(ackWaiter)) }
-            ackWaiter = nil
+            if ended || closing || sendingFinished || pendingLimit - pendingBytes >= writeThreshold,
+               let continuation = writer.signal() {
+                publications.append(.wake(continuation))
+            }
+            if ended || (pendingBytes == 0 && core.sendQueueLength == 0),
+               let continuation = acknowledger.signal() {
+                publications.append(.wake(continuation))
+            }
+        }
+
+        mutating func observeArena() {
+            let arena = core.arena
+            guard arena.isReclaimable else {
+                reclaimableSince = nil
+                return
+            }
+            if core.state >= .timeWait {
+                arena.reclaim()
+                reclaimableSince = nil
+            } else if reclaimableSince == nil {
+                reclaimableSince = core.stack.ticks
+            }
         }
 
         mutating func harvest() {
@@ -157,16 +234,47 @@ public final class Stream: Sendable {
             harvest()
             wakeWriters()
         }
+
+        mutating func read() -> Outcome<Data?> {
+            if closing { return .finished(nil) }
+            if case .accepted = admission, inputOffset < input.count {
+                let data = input[inputOffset]
+                inputOffset += 1
+                deliveredBytes += data.count
+                if inputOffset == input.count {
+                    input.removeAll(keepingCapacity: true); inputOffset = 0
+                } else if inputOffset >= 64 && inputOffset >= input.count / 2 {
+                    input.removeFirst(inputOffset); inputOffset = 0
+                }
+                return .finished(data)
+            }
+            if let failure { return .failure(failure) }
+            if ended || receivedFIN { return .finished(nil) }
+            return .wait
+        }
+
+        mutating func write(_ data: Data, from offset: inout Int) -> Outcome<Void> {
+            guard !ended, !closing, !sendingFinished else { return .failure(failure ?? .closed) }
+            while offset < data.count {
+                let count = min(data.count - offset, pendingLimit - pendingBytes)
+                guard count > 0 else { return .wait }
+                let start = data.startIndex + offset
+                pending.append(data[start..<(start + count)])
+                pendingBytes += count
+                offset += count
+                pump()
+                guard !ended else { break }
+            }
+            return offset == data.count ? .finished(()) : .failure(failure ?? .closed)
+        }
+
+        func acknowledgment() -> Outcome<Void> {
+            if let failure { return .failure(failure) }
+            if pendingBytes == 0 && core.sendQueueLength == 0 { return .finished(()) }
+            return ended ? .failure(.closed) : .wait
+        }
     }
-    
-    private enum WriteStep: Sendable {
-        case written(Int), failure(ConnectionError), wait(AsyncStream<Void>)
-    }
-    
-    private enum ReadStep: Sendable {
-        case bytes(Data), end, failure(ConnectionError), wait(AsyncStream<Void>)
-    }
-    
+
     public let source: IPEndpoint
     public let destination: IPEndpoint
     let key: ConnectionKey
@@ -175,12 +283,11 @@ public final class Stream: Sendable {
     private let clock: TickClock
     private let scheduled = Atomic<UInt32>(0)
     private let lingering = Atomic<Bool>(false)
-    private let pendingLimit: Int
     private let output: @Sendable ([OutboundPacket]) -> Void
     private let ready: @Sendable (PendingConnection) -> Void
     private let removed: @Sendable (Stream) -> Void
     private let schedule: @Sendable (UInt32) -> Void
-    
+
     public var isAttached: Bool { state.withLock { !$0.ended && !$0.closing } }
     public var sendBufferSpace: Int { state.withLock { $0.core.sendBufferSpace } }
     var isTimeWait: Bool { state.withLock { $0.core.state == .timeWait } }
@@ -202,13 +309,12 @@ public final class Stream: Sendable {
         self.generation = generation
         source = key.remote
         destination = key.local
-        self.pendingLimit = pendingLimit
         self.output = output
         self.ready = ready
         self.removed = removed
         self.schedule = schedule
         self.clock = clock
-        state = Mutex(State(packet: packet, initialSequenceNumber: initialSequenceNumber, ticks: clock.now))
+        state = Mutex(State(packet: packet, initialSequenceNumber: initialSequenceNumber, ticks: clock.now, pendingLimit: pendingLimit))
     }
 
     private func update<T: Sendable>(_ body: (inout State) -> T) -> T {
@@ -216,6 +322,7 @@ public final class Stream: Sendable {
             state.core.stack.advance(to: clock.now)
             let result = body(&state)
             state.harvest()
+            state.observeArena()
             let drain = !state.draining && !state.publications.isEmpty
             if drain { state.draining = true }
             let deadline = state.deadline.map { $0 == 0 ? 1 : $0 } ?? 0
@@ -227,7 +334,7 @@ public final class Stream: Sendable {
         if deadline != 0, previous == 0 || Sequence.lessThan(deadline, previous) { schedule(deadline) }
         return result
     }
-    
+
     private func drainPublications() {
         var batch: [Publication] = []
         while true {
@@ -244,11 +351,51 @@ public final class Stream: Sendable {
                 case .output: break
                 case .ready: ready(PendingConnection(stream: self))
                 case .remove: removed(self)
-                case .wake(let continuation): continuation.finish()
+                case .wake(let continuation): continuation.resume()
                 }
             }
             if !packets.isEmpty { output(packets) }
             batch.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private func perform<Value: Sendable>(_ role: Role, _ step: (inout State) -> Outcome<Value>) async throws -> Value {
+        var claimed = false
+        defer {
+            if claimed { state.withLock { $0.withWaiter(role) { $0.hold(false) } } }
+        }
+        while true {
+            try Task.checkCancellation()
+            let outcome = update { state -> Outcome<Value> in
+                if !claimed {
+                    guard !state.withWaiter(role, { $0.isBusy }) else { return .failure(.concurrentOperation) }
+                    claimed = true
+                }
+                let outcome = step(&state)
+                claimed = outcome.isWaiting
+                state.withWaiter(role) { $0.hold(claimed) }
+                return outcome
+            }
+            switch outcome {
+            case .finished(let value): return value
+            case .failure(let error): throw error
+            case .wait: await park(role)
+            }
+        }
+    }
+
+    private func park(_ role: Role) async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let parked = state.withLock { state in
+                    state.withWaiter(role) { waiter in waiter.park(continuation) }
+                }
+                if !parked { continuation.resume() }
+            }
+        } onCancel: {
+            state.withLock { state in
+                state.withWaiter(role) { waiter in waiter.signal() }
+            }?.resume()
         }
     }
 
@@ -290,6 +437,10 @@ public final class Stream: Sendable {
     func expire() -> UInt32 {
         update { state in
             let ticks = state.core.stack.ticks
+            if let since = state.reclaimableSince, ticks &- since >= Constants.arenaReclaimDelay {
+                state.core.arena.reclaim()
+                state.reclaimableSince = nil
+            }
             guard state.core.state != .closed else { return }
             if state.core.state == .timeWait {
                 if ticks &- state.core.tmr > Constants.timeWaitTimeout {
@@ -338,13 +489,13 @@ public final class Stream: Sendable {
             }
         }
     }
-    
+
     @discardableResult public func enqueue(_ data: Data) -> Bool {
         guard !data.isEmpty else { return true }
         return update { state in
-            guard !state.ended, !state.closing, !state.sendingFinished, !state.writing,
+            guard !state.ended, !state.closing, !state.sendingFinished, !state.writer.isBusy,
                   case .accepted = state.admission,
-                  data.count <= pendingLimit - state.pendingBytes else { return false }
+                  data.count <= state.pendingLimit - state.pendingBytes else { return false }
             state.pending.append(data)
             state.pendingBytes += data.count
             state.pump()
@@ -353,79 +504,14 @@ public final class Stream: Sendable {
     }
 
     public func send(_ data: Data) async throws {
-        try Task.checkCancellation()
-        let claim: ConnectionError? = update { state in
-            if state.ended || state.closing || state.sendingFinished { return state.failure ?? .closed }
-            if state.writing { return .concurrentOperation }
-            state.writing = true
-            return nil
-        }
-        if let claim { throw claim }
-        defer { update { $0.writing = false; $0.writeWaiter = nil } }
         var offset = 0
-        while offset < data.count {
-            try Task.checkCancellation()
-            let step: WriteStep = update { state in
-                if state.ended || state.closing || state.sendingFinished { return .failure(state.failure ?? .closed) }
-                let count = min(data.count - offset, pendingLimit - state.pendingBytes)
-                if count > 0 {
-                    let start = data.startIndex + offset
-                    state.pending.append(data[start..<(start + count)])
-                    state.pendingBytes += count
-                    state.pump()
-                    return .written(count)
-                }
-                let (stream, continuation) = AsyncStream<Void>.makeStream()
-                state.writeWaiter = continuation
-                return .wait(stream)
-            }
-            switch step {
-            case .written(let count): offset += count
-            case .failure(let error): throw error
-            case .wait(let signal): for await _ in signal { break }
-            }
-        }
+        try await perform(.writer) { $0.write(data, from: &offset) }
     }
 
     public func receive() async throws -> Data? {
-        try Task.checkCancellation()
-        let claimed = update { state in
-            guard !state.reading else { return false }
-            state.reading = true
-            return true
-        }
-        guard claimed else { throw ConnectionError.concurrentOperation }
-        defer { update { $0.reading = false; $0.readWaiter = nil } }
-        while true {
-            try Task.checkCancellation()
-            let step: ReadStep = update { state in
-                if state.closing { return .end }
-                if case .accepted = state.admission, state.inputOffset < state.input.count {
-                    let data = state.input[state.inputOffset]
-                    state.inputOffset += 1
-                    state.deliveredBytes += data.count
-                    if state.inputOffset == state.input.count {
-                        state.input.removeAll(keepingCapacity: true); state.inputOffset = 0
-                    } else if state.inputOffset >= 64 && state.inputOffset >= state.input.count / 2 {
-                        state.input.removeFirst(state.inputOffset); state.inputOffset = 0
-                    }
-                    return .bytes(data)
-                }
-                if let error = state.failure { return .failure(error) }
-                if state.ended || state.receivedFIN { return .end }
-                let (stream, continuation) = AsyncStream<Void>.makeStream()
-                state.readWaiter = continuation
-                return .wait(stream)
-            }
-            switch step {
-            case .bytes(let data): return data
-            case .end: return nil
-            case .failure(let error): throw error
-            case .wait(let signal): for await _ in signal { break }
-            }
-        }
+        try await perform(.reader) { $0.read() }
     }
-    
+
     public func didConsume(_ byteCount: Int) {
         guard byteCount > 0 else { return }
         update { state in
@@ -435,7 +521,7 @@ public final class Stream: Sendable {
             state.core.output()
         }
     }
-    
+
     public func finishSending() {
         update { state in
             state.sendingFinished = true
@@ -444,31 +530,9 @@ public final class Stream: Sendable {
     }
 
     public func waitUntilAcknowledged() async throws {
-        let claimed = update { state in
-            guard !state.waitingForACK else { return false }
-            state.waitingForACK = true
-            return true
-        }
-        guard claimed else { throw ConnectionError.concurrentOperation }
-        defer { update { $0.waitingForACK = false; $0.ackWaiter = nil } }
-        while true {
-            try Task.checkCancellation()
-            let step: WriteStep = update { state in
-                if let failure = state.failure { return .failure(failure) }
-                if state.pendingBytes == 0 && state.core.sendQueueLength == 0 { return .written(0) }
-                if state.ended { return .failure(.closed) }
-                let (stream, continuation) = AsyncStream<Void>.makeStream()
-                state.ackWaiter = continuation
-                return .wait(stream)
-            }
-            switch step {
-            case .written: return
-            case .failure(let error): throw error
-            case .wait(let signal): for await _ in signal { break }
-            }
-        }
+        try await perform(.acknowledger) { $0.acknowledgment() }
     }
-    
+
     public func close(discardingReceived: Bool = false) {
         update { state in
             guard !state.ended, !state.closing else { return }
@@ -485,7 +549,7 @@ public final class Stream: Sendable {
     }
 
     public func cancel() { terminate(sendingReset: true) }
-    
+
     public func discard() { terminate(sendingReset: false) }
 
     private func terminate(sendingReset: Bool) {

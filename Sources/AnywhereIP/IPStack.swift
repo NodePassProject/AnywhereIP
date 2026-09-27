@@ -212,18 +212,14 @@ public final class IPStack: Sendable {
 
     private func reset(_ packet: InboundTCP, sequenceNumber: UInt32) {
         let header = packet.header
-        let context = Context(initialSequenceNumber: 0, ticks: ticks)
         let length = UInt32(packet.payload.count) + (header.flags.contains(.syn) || header.flags.contains(.fin) ? 1 : 0)
-        context.sendReset(
-            from: packet.key.local,
+        guard let reset = OutboundPacket(
+            resetFrom: packet.key.local,
             to: packet.key.remote,
             sequenceNumber: sequenceNumber,
             acknowledgmentNumber: header.sequenceNumber &+ length
-        )
-        let packets = context.effects.compactMap { effect -> OutboundPacket? in
-            if case .packet(let packet) = effect { packet } else { nil }
-        }
-        outputHandler(packets)
+        ) else { return }
+        outputHandler([reset])
     }
 
     private func deliverBatch(_ packets: [InboundTCP], generation: UInt64) {

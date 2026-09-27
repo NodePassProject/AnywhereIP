@@ -52,55 +52,28 @@ final class Context {
     }
 
     func sendReset(from local: IPEndpoint, to remote: IPEndpoint, sequenceNumber: UInt32, acknowledgmentNumber: UInt32) {
-        let segment = arena.allocate(sequenceNumber: sequenceNumber, flags: [.rst, .ack])
-        transmit(segment, from: local, to: remote, acknowledgmentNumber: acknowledgmentNumber, window: Constants.resetWindow)
+        guard let packet = OutboundPacket(resetFrom: local, to: remote, sequenceNumber: sequenceNumber, acknowledgmentNumber: acknowledgmentNumber) else { return }
+        effects.append(.packet(packet))
     }
 
     func transmit(_ segment: Segment, from local: IPEndpoint, to remote: IPEndpoint, acknowledgmentNumber: UInt32, window: UInt16) {
+        defer { if !segment.isQueued { arena.recycle(segment) } }
         let isIPv6 = local.address.isIPv6
-        let ipLength = isIPv6 ? IPv6Header.length : IPv4Header.length
-        let start = IPv6Header.length - ipLength
-        let tcpLength = TCPHeader.length + segment.options.encodedLength + segment.length
-        let packet = UnsafeMutableRawBufferPointer(rebasing: segment.buffer[start..<(IPv6Header.length + tcpLength)])
-        switch (local.address, remote.address) {
-        case (.v4(let source), .v4(let destination)):
-            IPv4Header(
-                totalLength: ipLength + tcpLength,
-                timeToLive: Constants.hopLimit,
-                protocol: 6,
-                source: source,
-                destination: destination,
-                identification: PacketIdentification.next()
-            ).write(to: packet)
-        case (.v6(let source), .v6(let destination)):
-            IPv6Header(
-                payloadLength: tcpLength,
-                nextHeader: 6,
-                hopLimit: Constants.hopLimit,
-                source: source,
-                destination: destination
-            ).write(to: packet)
-        default:
-            return
-        }
-        let tcp = UnsafeMutableRawBufferPointer(rebasing: packet[ipLength...])
-        TCPHeader(
-            sourcePort: local.port,
-            destinationPort: remote.port,
+        let start = IPv6Header.length - (isIPv6 ? IPv6Header.length : IPv4Header.length)
+        let end = IPv6Header.length + TCPHeader.length + segment.options.encodedLength + segment.length
+        let packet = UnsafeMutableRawBufferPointer(rebasing: segment.buffer[start..<end])
+        guard OutboundPacket.encodeTCP(
+            into: packet,
+            from: local,
+            to: remote,
             sequenceNumber: segment.sequenceNumber,
             acknowledgmentNumber: acknowledgmentNumber,
-            dataOffset: TCPHeader.length + segment.options.encodedLength,
             flags: segment.flags,
-            window: window
-        ).write(to: tcp)
-        segment.options.write(to: UnsafeMutableRawBufferPointer(rebasing: tcp[TCPHeader.length...]))
-        var checksum = InternetChecksum()
-        checksum.update(pseudoHeaderFor: local.address, destination: remote.address, protocol: 6, length: tcpLength)
-        checksum.update(bufferPointer: UnsafeRawBufferPointer(rebasing: UnsafeRawBufferPointer(tcp)[..<(tcpLength - segment.length)]))
-        checksum.update(partialSum: segment.payloadSum, byteCount: segment.length)
-        tcp.storeBytes(of: checksum.finalize(), toByteOffset: 16, as: UInt16.self)
-        let outbound = OutboundPacket(data: Data(packet), isIPv6: isIPv6)
-        if !segment.isQueued { arena.recycle(segment) }
-        effects.append(.packet(outbound))
+            options: segment.options,
+            window: window,
+            payloadLength: segment.length,
+            payloadSum: segment.payloadSum
+        ) else { return }
+        effects.append(.packet(OutboundPacket(data: Data(packet), isIPv6: isIPv6)))
     }
 }
