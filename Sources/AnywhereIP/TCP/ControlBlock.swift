@@ -123,18 +123,13 @@ final class ControlBlock {
     }
 
     func didConsume(_ count: Int) {
-        guard isAttached, state != .timeWait, state != .closed else { return }
-        var remaining = count
-        while remaining > 0 {
-            let chunk = UInt32(min(remaining, Int(UInt16.max)))
-            remaining -= Int(chunk)
-            let grown = rcvWnd &+ chunk
-            rcvWnd = (grown > windowMax || grown < rcvWnd) ? windowMax : grown
-            if updateAnnouncedWindow() >= Constants.windowUpdateThreshold {
-                flags.insert(.ackNow)
-                output()
-            }
-        }
+        guard isAttached, state != .timeWait, state != .closed, count > 0 else { return }
+        let announced = Sequence.lessThan(rcvNxt, rcvAnnRightEdge) ? rcvAnnRightEdge &- rcvNxt : 0
+        rcvWnd = UInt32(min(UInt64(rcvWnd) + UInt64(count), UInt64(windowMax)))
+        updateAnnouncedWindow()
+        guard announced <= windowMax / 2, rcvAnnWnd > 0, rcvAnnWnd >= announced * 2 else { return }
+        flags.insert(.ackNow)
+        output()
     }
 
     func shutdownSend() {
@@ -302,18 +297,14 @@ final class ControlBlock {
         stack.effects.append(.timeWait)
     }
 
-    private func updateAnnouncedWindow() -> UInt32 {
-        let newRightEdge = rcvNxt &+ rcvWnd
-        if Sequence.lessThanOrEqual(rcvAnnRightEdge &+ min(Constants.window / 2, UInt32(mss)), newRightEdge) {
+    private func updateAnnouncedWindow() {
+        if Sequence.lessThanOrEqual(rcvAnnRightEdge &+ min(Constants.window / 2, UInt32(mss)), rcvNxt &+ rcvWnd) {
             rcvAnnWnd = rcvWnd
-            return newRightEdge &- rcvAnnRightEdge
-        }
-        if Sequence.lessThan(rcvAnnRightEdge, rcvNxt) {
+        } else if Sequence.lessThan(rcvAnnRightEdge, rcvNxt) {
             rcvAnnWnd = 0
         } else {
             rcvAnnWnd = rcvAnnRightEdge &- rcvNxt
         }
-        return 0
     }
 
     private var announcedWindow: UInt16 {
@@ -811,7 +802,7 @@ final class ControlBlock {
                     }
                     rcvNxt = seqno &+ tcpLength
                     rcvWnd -= tcpLength
-                    _ = updateAnnouncedWindow()
+                    updateAnnouncedWindow()
                     if dataLength > 0 {
                         data = UnsafeRawBufferPointer(rebasing: payload[dataOffset..<(dataOffset + dataLength)])
                     }

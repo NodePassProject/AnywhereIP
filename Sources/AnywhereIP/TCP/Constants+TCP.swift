@@ -21,7 +21,6 @@ extension Constants {
     static let arenaReclaimDelay: UInt32 = 10
     static let coarseTimerThreshold: UInt32 = 10
     static let coarseTimerGranularity: UInt32 = 5
-    static let windowUpdateThreshold: UInt32 = 11680
     static let resetWindow: UInt16 = 730
     static let retransmissionBackoff: [Int16] = [1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7]
     static let persistBackoff: [UInt8] = [3, 6, 12, 24, 48, 96, 120]
