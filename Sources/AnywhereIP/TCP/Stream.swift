@@ -15,6 +15,7 @@ public final class Stream: Sendable {
         case output(OutboundPacket)
         case ready
         case remove
+        case delayAcknowledgment
         case wake(CheckedContinuation<Void, Never>)
     }
 
@@ -71,8 +72,7 @@ public final class Stream: Sendable {
         var started = false
         var admission = Admission.handshake
         var admissionTick: UInt32 = 0
-        var input: [Data] = []
-        var inputOffset = 0
+        var input = ReceiveBuffer()
         var deferredAcknowledgment: OutboundPacket?
         var deliveredBytes = 0
         var receivedFIN = false
@@ -87,20 +87,20 @@ public final class Stream: Sendable {
         var writer = Waiter()
         var acknowledger = Waiter()
         var reclaimableSince: UInt32?
+        var acknowledgmentQueued = false
         var publications: [Publication] = []
         var draining = false
 
-        init(packet: InboundTCP, initialSequenceNumber: UInt32, ticks: UInt32, pendingLimit: Int) {
-            let context = Context(initialSequenceNumber: initialSequenceNumber, ticks: ticks)
-            core = packet.options.withUnsafeBytes {
-                ControlBlock(
-                    stack: context,
-                    key: packet.key,
-                    initialSequenceNumber: packet.header.sequenceNumber,
-                    peerWindow: packet.header.window,
-                    options: $0
-                )
-            }
+        init(packet: InboundTCP, initialSequenceNumber: UInt32, ticks: UInt32, pendingLimit: Int, delaysAcknowledgment: Bool) {
+            let context = Context(key: packet.key, initialSequenceNumber: initialSequenceNumber, ticks: ticks)
+            core = ControlBlock(
+                stack: context,
+                key: packet.key,
+                initialSequenceNumber: packet.header.sequenceNumber,
+                peerWindow: packet.header.window,
+                options: packet.options,
+                delaysAcknowledgment: delaysAcknowledgment
+            )
             self.pendingLimit = pendingLimit
             writeThreshold = max(1, pendingLimit / 2)
         }
@@ -114,6 +114,10 @@ public final class Stream: Sendable {
             if let reclaimableSince {
                 let reclaim = TickClock.align(reclaimableSince, after: Constants.arenaReclaimDelay)
                 if deadline.map({ Sequence.lessThan(reclaim, $0) }) ?? true { deadline = reclaim }
+            }
+            if let unsealedSince = input.unsealedSince {
+                let seal = TickClock.align(unsealedSince, after: Constants.receiveSealDelay)
+                if deadline.map({ Sequence.lessThan(seal, $0) }) ?? true { deadline = seal }
             }
             guard let deadline else { return nil }
             let now = core.stack.ticks
@@ -168,20 +172,15 @@ public final class Stream: Sendable {
             for effect in effects {
                 switch effect {
                 case .packet(let packet):
-                    let flags = packet.data[packet.data.startIndex + (packet.isIPv6 ? 40 : 20) + 13]
-                    if case .pending = admission, flags & TCPHeader.Flags.rst.rawValue == 0 {
+                    if case .pending = admission, !packet.flags.contains(.rst) {
                         deferredAcknowledgment = packet
                     } else {
                         publications.append(.output(packet))
                     }
-                case .received(let bytes):
+                case .received(let bytes, let push):
                     if !ended {
-                        if input.count > inputOffset, input[input.count - 1].count + bytes.count <= 16 * 1024 {
-                            input[input.count - 1].append(bytes)
-                        } else {
-                            input.append(bytes)
-                        }
-                        wakeReaders()
+                        input.append(bytes, push: push, ticks: core.stack.ticks)
+                        if input.hasReadableChunk(flushing: false) { wakeReaders() }
                     }
                 case .acknowledged: wakeWriters()
                 case .ready:
@@ -204,7 +203,7 @@ public final class Stream: Sendable {
             ended = true
             if error != nil {
                 admission = .rejected
-                input.removeAll(); inputOffset = 0
+                input.removeAll()
             }
             deferredAcknowledgment = nil
             pending.removeAll(); pendingOffset = 0; pendingBytes = 0
@@ -237,15 +236,8 @@ public final class Stream: Sendable {
 
         mutating func read() -> Outcome<Data?> {
             if closing { return .finished(nil) }
-            if case .accepted = admission, inputOffset < input.count {
-                let data = input[inputOffset]
-                inputOffset += 1
+            if case .accepted = admission, let data = input.next(flushing: receivedFIN || ended) {
                 deliveredBytes += data.count
-                if inputOffset == input.count {
-                    input.removeAll(keepingCapacity: true); inputOffset = 0
-                } else if inputOffset >= 64 && inputOffset >= input.count / 2 {
-                    input.removeFirst(inputOffset); inputOffset = 0
-                }
                 return .finished(data)
             }
             if let failure { return .failure(failure) }
@@ -287,6 +279,7 @@ public final class Stream: Sendable {
     private let ready: @Sendable (PendingConnection) -> Void
     private let removed: @Sendable (Stream) -> Void
     private let schedule: @Sendable (UInt32) -> Void
+    private let delayAcknowledgment: @Sendable (Stream) -> Void
 
     public var isAttached: Bool { state.withLock { !$0.ended && !$0.closing } }
     public var sendBufferSpace: Int { state.withLock { $0.core.sendBufferSpace } }
@@ -300,10 +293,12 @@ public final class Stream: Sendable {
         clock: TickClock,
         generation: UInt64,
         pendingLimit: Int,
+        delaysAcknowledgment: Bool,
         output: @escaping @Sendable ([OutboundPacket]) -> Void,
         ready: @escaping @Sendable (PendingConnection) -> Void,
         removed: @escaping @Sendable (Stream) -> Void,
-        schedule: @escaping @Sendable (UInt32) -> Void
+        schedule: @escaping @Sendable (UInt32) -> Void,
+        delayAcknowledgment: @escaping @Sendable (Stream) -> Void
     ) {
         key = packet.key
         self.generation = generation
@@ -313,8 +308,9 @@ public final class Stream: Sendable {
         self.ready = ready
         self.removed = removed
         self.schedule = schedule
+        self.delayAcknowledgment = delayAcknowledgment
         self.clock = clock
-        state = Mutex(State(packet: packet, initialSequenceNumber: initialSequenceNumber, ticks: clock.now, pendingLimit: pendingLimit))
+        state = Mutex(State(packet: packet, initialSequenceNumber: initialSequenceNumber, ticks: clock.now, pendingLimit: pendingLimit, delaysAcknowledgment: delaysAcknowledgment))
     }
 
     private func update<T: Sendable>(_ body: (inout State) -> T) -> T {
@@ -323,6 +319,10 @@ public final class Stream: Sendable {
             let result = body(&state)
             state.harvest()
             state.observeArena()
+            if state.core.acknowledgmentHeld, !state.acknowledgmentQueued {
+                state.acknowledgmentQueued = true
+                state.publications.append(.delayAcknowledgment)
+            }
             let drain = !state.draining && !state.publications.isEmpty
             if drain { state.draining = true }
             let deadline = state.deadline.map { $0 == 0 ? 1 : $0 } ?? 0
@@ -351,6 +351,7 @@ public final class Stream: Sendable {
                 case .output: break
                 case .ready: ready(PendingConnection(stream: self))
                 case .remove: removed(self)
+                case .delayAcknowledgment: delayAcknowledgment(self)
                 case .wake(let continuation): continuation.resume()
                 }
             }
@@ -419,11 +420,7 @@ public final class Stream: Sendable {
                 if core.state == .timeWait {
                     core.timeWaitInput(header: packet.header, payloadCount: packet.payload.count)
                 } else {
-                    packet.options.withUnsafeBytes { options in
-                        core.stack.withPayload(packet.payload) { payload in
-                            core.input(header: packet.header, options: options, payload: payload)
-                        }
-                    }
+                    core.input(header: packet.header, options: packet.options, payload: packet.payload)
                 }
                 state.harvest()
             }
@@ -434,12 +431,23 @@ public final class Stream: Sendable {
         }
     }
 
+    func flushAcknowledgment() {
+        update { state in
+            state.acknowledgmentQueued = false
+            state.core.flushHeldAcknowledgment()
+        }
+    }
+
     func expire() -> UInt32 {
         update { state in
             let ticks = state.core.stack.ticks
             if let since = state.reclaimableSince, ticks &- since >= Constants.arenaReclaimDelay {
                 state.core.arena.reclaim()
                 state.reclaimableSince = nil
+            }
+            if let since = state.input.unsealedSince, ticks &- since >= Constants.receiveSealDelay {
+                state.input.seal()
+                state.wakeReaders()
             }
             guard state.core.state != .closed else { return }
             if state.core.state == .timeWait {
@@ -538,11 +546,11 @@ public final class Stream: Sendable {
             guard !state.ended, !state.closing else { return }
             state.closing = true
             if discardingReceived {
-                let unread = state.input[state.inputOffset...].reduce(state.deliveredBytes) { $0 + $1.count }
+                let unread = state.input.unreadByteCount + state.deliveredBytes
                 state.deliveredBytes = 0
                 state.core.didConsume(unread)
             }
-            state.input.removeAll(); state.inputOffset = 0
+            state.input.removeAll()
             state.pump()
             state.wakeReaders(); state.wakeWriters()
         }

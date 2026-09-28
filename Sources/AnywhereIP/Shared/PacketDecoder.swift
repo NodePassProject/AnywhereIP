@@ -12,43 +12,34 @@ struct PacketDecoder {
     var udp: InboundDatagram?
     var output: [OutboundPacket] = []
     private let decodesUDP: Bool
-    private var input = Data()
-    private var inputBase: UnsafeRawPointer?
 
     init(decodesUDP: Bool) {
         self.decodesUDP = decodesUDP
     }
 
-    mutating func decode(_ packet: Data) {
-        input = packet
-        packet.withUnsafeBytes { bytes in
-            inputBase = bytes.baseAddress
-            receive(bytes)
-        }
-        inputBase = nil
-    }
-
     mutating func deliverTCP(_ segment: UnsafeRawBufferPointer, source: IPAddress, destination: IPAddress) {
-        guard let header = TCPHeader(parsing: segment), let base = segment.baseAddress, let inputBase else { return }
-        let offset = inputBase.distance(to: base) + header.dataOffset
-        let start = input.startIndex + offset
-        tcp = InboundTCP(key: ConnectionKey(remote: IPEndpoint(address: source, port: header.sourcePort), local: IPEndpoint(address: destination, port: header.destinationPort)), header: header, options: Data(segment[TCPHeader.length..<header.dataOffset]), payload: input[start..<(start + segment.count - header.dataOffset)])
-    }
-
-    mutating func deliverUDP(_ segment: UnsafeRawBufferPointer, in datagram: UnsafeRawBufferPointer, source: IPAddress, destination: IPAddress) {
-        guard let header = UDPHeader(parsing: segment), let base = segment.baseAddress,
-              let datagramBase = datagram.baseAddress, let inputBase else { return }
-        let packetStart = input.startIndex + inputBase.distance(to: datagramBase)
-        let start = input.startIndex + inputBase.distance(to: base) + UDPHeader.length
-        udp = InboundDatagram(
-            source: IPEndpoint(address: source, port: header.sourcePort),
-            destination: IPEndpoint(address: destination, port: header.destinationPort),
-            payload: input[start..<(start + header.totalLength - UDPHeader.length)],
-            packet: input[packetStart..<(packetStart + datagram.count)]
+        guard let header = TCPHeader(parsing: segment) else { return }
+        tcp = InboundTCP(
+            key: ConnectionKey(remote: IPEndpoint(address: source, port: header.sourcePort), local: IPEndpoint(address: destination, port: header.destinationPort)),
+            header: header,
+            options: UnsafeRawBufferPointer(rebasing: segment[TCPHeader.length..<header.dataOffset]),
+            payload: UnsafeRawBufferPointer(rebasing: segment[header.dataOffset...])
         )
     }
 
-    mutating func receive(_ packet: UnsafeRawBufferPointer) {
+    mutating func deliverUDP(_ segment: UnsafeRawBufferPointer, in datagram: UnsafeRawBufferPointer, source: IPAddress, destination: IPAddress) {
+        guard let header = UDPHeader(parsing: segment), let base = segment.baseAddress, let datagramBase = datagram.baseAddress else { return }
+        let packet = Data(datagram)
+        let start = datagramBase.distance(to: base) + UDPHeader.length
+        udp = InboundDatagram(
+            source: IPEndpoint(address: source, port: header.sourcePort),
+            destination: IPEndpoint(address: destination, port: header.destinationPort),
+            payload: packet[start..<(start + header.totalLength - UDPHeader.length)],
+            packet: packet
+        )
+    }
+
+    mutating func decode(_ packet: UnsafeRawBufferPointer) {
         guard let first = packet.first else { return }
         switch first >> 4 {
         case 4: receiveIPv4(packet)
@@ -137,7 +128,7 @@ struct PacketDecoder {
         output.append(ICMPMessage.error(type: 4, code: code, parameter: pointer, quoting: datagram, from: header.destination, to: header.source))
     }
 
-    mutating func send(byteCount: Int, isIPv6: Bool, _ fill: (UnsafeMutableRawBufferPointer) -> Void) {
+    private mutating func send(byteCount: Int, isIPv6: Bool, _ fill: (UnsafeMutableRawBufferPointer) -> Void) {
         output.append(OutboundPacket(byteCount: byteCount, isIPv6: isIPv6, fill))
     }
 }

@@ -7,9 +7,9 @@
 
 import Foundation
 
-struct InboundTCP: Sendable {
+struct InboundTCP: @unchecked Sendable {
     let key: ConnectionKey
     let header: TCPHeader
-    let options: Data
-    let payload: Data
+    let options: UnsafeRawBufferPointer
+    let payload: UnsafeRawBufferPointer
 }

@@ -13,12 +13,20 @@ public final class IPStack: Sendable {
         public var maximumConnections: Int
         public var pendingSendBytes: Int
         public var parallelism: Int
+        public var acknowledgmentDelay: Duration?
 
-        public init(maximumConnections: Int = 1024, pendingSendBytes: Int = 64 * 1024, parallelism: Int = 4) {
+        public init(
+            maximumConnections: Int = 1024,
+            pendingSendBytes: Int = 64 * 1024,
+            parallelism: Int = 4,
+            acknowledgmentDelay: Duration? = nil
+        ) {
             precondition(maximumConnections > 0 && pendingSendBytes > 0 && parallelism > 0)
+            precondition(acknowledgmentDelay.map { $0 > .zero } ?? true)
             self.maximumConnections = maximumConnections
             self.pendingSendBytes = pendingSendBytes
             self.parallelism = parallelism
+            self.acknowledgmentDelay = acknowledgmentDelay
         }
     }
 
@@ -35,6 +43,12 @@ public final class IPStack: Sendable {
     private struct TimerDriver {
         var running = false
         var pending = false
+        var finished = false
+        var waiter: CheckedContinuation<Bool, Never>?
+    }
+
+    private struct AcknowledgmentQueue {
+        var streams: [Stream] = []
         var finished = false
         var waiter: CheckedContinuation<Bool, Never>?
     }
@@ -55,6 +69,7 @@ public final class IPStack: Sendable {
     private let clock = TickClock()
     private let initialSequence = Atomic<UInt32>(UInt32.random(in: .min ... .max))
     private let timerDriver = Mutex(TimerDriver())
+    private let acknowledgments = Mutex(AcknowledgmentQueue())
     private let armed = Atomic<UInt64>(0)
     
     public var isIdle: Bool { admission.withLock { $0.count == 0 } }
@@ -82,58 +97,59 @@ public final class IPStack: Sendable {
     }
     
     public func input(_ packet: Data) {
-        guard let generation = liveGeneration() else { return }
-        var decoder = PacketDecoder(decodesUDP: datagramHandler != nil)
-        decoder.decode(packet)
-        guard isLive(generation) else { return }
-        if !decoder.output.isEmpty { outputHandler(decoder.output) }
-        if let udp = decoder.udp { datagramHandler?([udp]) }
-        if let tcp = decoder.tcp { deliver(tcp, generation: generation) }
+        packet.withUnsafeBytes { input([$0]) }
     }
-    
-    @concurrent public func inputBatch(_ packets: [Data]) async {
-        guard let generation = liveGeneration(), !packets.isEmpty else { return }
-        var partitions = Array(repeating: [ConnectionKey: [InboundTCP]](), count: configuration.parallelism)
-        var loads = Array(repeating: 0, count: configuration.parallelism)
-        var control: [OutboundPacket] = []
-        var datagrams: [InboundDatagram] = []
-        let decodesUDP = datagramHandler != nil
-        for packet in packets {
-            var decoder = PacketDecoder(decodesUDP: decodesUDP)
-            decoder.decode(packet)
-            control.append(contentsOf: decoder.output)
-            if let udp = decoder.udp { datagrams.append(udp) }
-            if let tcp = decoder.tcp {
-                let index = Int(tcp.key.fingerprint % UInt64(partitions.count))
-                partitions[index][tcp.key, default: []].append(tcp)
-                loads[index] += 1
-            }
-        }
-        guard isLive(generation) else { return }
-        if !control.isEmpty { outputHandler(control) }
-        if !datagrams.isEmpty { datagramHandler?(datagrams) }
-        guard let inline = loads.firstIndex(where: { $0 >= Self.parallelPartitionLoad }),
-              loads.count(where: { $0 >= Self.parallelPartitionLoad }) > 1 else {
-            for partition in partitions where !partition.isEmpty {
-                deliverPartition(partition, generation: generation)
-            }
+
+    public func input(_ packets: [Data]) {
+        var buffers: [UnsafeRawBufferPointer] = []
+        buffers.reserveCapacity(packets.count)
+        withBuffers(of: packets[...], appendingTo: &buffers)
+    }
+
+    private func withBuffers(of packets: ArraySlice<Data>, appendingTo buffers: inout [UnsafeRawBufferPointer]) {
+        guard let first = packets.first else {
+            input(buffers)
             return
         }
-        await withTaskGroup(of: Void.self) { group in
-            for index in partitions.indices where index != inline && loads[index] >= Self.parallelPartitionLoad {
-                let partition = partitions[index]
-                group.addTask { self.deliverPartition(partition, generation: generation) }
-            }
-            for index in partitions.indices where index == inline || (loads[index] < Self.parallelPartitionLoad && loads[index] > 0) {
-                deliverPartition(partitions[index], generation: generation)
-            }
+        first.withUnsafeBytes { bytes in
+            buffers.append(bytes)
+            withBuffers(of: packets.dropFirst(), appendingTo: &buffers)
         }
     }
 
-    private func deliverPartition(_ partition: [ConnectionKey: [InboundTCP]], generation: UInt64) {
-        for (_, packets) in partition {
-            guard !Task.isCancelled, isLive(generation) else { return }
-            deliverBatch(packets, generation: generation)
+    public func input(_ packets: [UnsafeRawBufferPointer]) {
+        guard let generation = liveGeneration(), !packets.isEmpty else { return }
+        var batch = InboundBatch(decodesUDP: datagramHandler != nil)
+        for packet in packets { batch.decode(packet) }
+        guard isLive(generation) else { return }
+        if !batch.control.isEmpty { outputHandler(batch.control) }
+        if !batch.datagrams.isEmpty { datagramHandler?(batch.datagrams) }
+        deliver(batch.groups, segmentCount: batch.segmentCount, generation: generation)
+    }
+
+    private func deliver(_ groups: [[InboundTCP]], segmentCount: Int, generation: UInt64) {
+        let partitionCount = configuration.parallelism
+        guard partitionCount > 1, segmentCount >= 2 * Self.parallelPartitionLoad else {
+            for group in groups { deliverGroup(group, generation: generation) }
+            return
+        }
+        var partitions = Array(repeating: [Int](), count: partitionCount)
+        var loads = Array(repeating: 0, count: partitionCount)
+        for (position, group) in groups.enumerated() {
+            let partition = Int(group[0].key.fingerprint % UInt64(partitionCount))
+            partitions[partition].append(position)
+            loads[partition] += group.count
+        }
+        let heavy = loads.indices.filter { loads[$0] >= Self.parallelPartitionLoad }.map { partitions[$0] }
+        guard heavy.count > 1 else {
+            for group in groups { deliverGroup(group, generation: generation) }
+            return
+        }
+        DispatchQueue.concurrentPerform(iterations: heavy.count) { index in
+            for position in heavy[index] { deliverGroup(groups[position], generation: generation) }
+        }
+        for partition in partitions.indices where loads[partition] < Self.parallelPartitionLoad {
+            for position in partitions[partition] { deliverGroup(groups[position], generation: generation) }
         }
     }
 
@@ -196,13 +212,15 @@ public final class IPStack: Sendable {
                 clock: clock,
                 generation: generation,
                 pendingLimit: configuration.pendingSendBytes,
+                delaysAcknowledgment: configuration.acknowledgmentDelay != nil,
                 output: { [weak self] packets in self?.outputHandler(packets) },
                 ready: { [weak self] pending in
                     guard let self else { pending.reject(); return }
                     self.acceptHandler(pending)
                 },
                 removed: { [weak self] in self?.remove($0) },
-                schedule: { [weak self] in self?.schedule($0) }
+                schedule: { [weak self] in self?.schedule($0) },
+                delayAcknowledgment: { [weak self] in self?.delayAcknowledgment($0) }
             )
             entries[packet.key] = connection
             return connection
@@ -222,7 +240,7 @@ public final class IPStack: Sendable {
         outputHandler([reset])
     }
 
-    private func deliverBatch(_ packets: [InboundTCP], generation: UInt64) {
+    private func deliverGroup(_ packets: [InboundTCP], generation: UInt64) {
         guard let first = packets.first else { return }
         var position = 0
         while position < packets.count {
@@ -315,6 +333,50 @@ public final class IPStack: Sendable {
             defer { driver.waiter = nil }
             return driver.waiter
         }?.resume(returning: false)
+        acknowledgments.withLock { queue in
+            queue.finished = true
+            queue.streams.removeAll()
+            defer { queue.waiter = nil }
+            return queue.waiter
+        }?.resume(returning: false)
+    }
+
+    private func delayAcknowledgment(_ stream: Stream) {
+        acknowledgments.withLock { queue -> CheckedContinuation<Bool, Never>? in
+            guard !queue.finished else { return nil }
+            queue.streams.append(stream)
+            defer { queue.waiter = nil }
+            return queue.waiter
+        }?.resume(returning: true)
+    }
+
+    private func waitForDelayedAcknowledgments() async -> Bool {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let immediate = acknowledgments.withLock { queue -> Bool? in
+                    if queue.finished || Task.isCancelled { return false }
+                    if !queue.streams.isEmpty { return true }
+                    queue.waiter = continuation
+                    return nil
+                }
+                if let immediate { continuation.resume(returning: immediate) }
+            }
+        } onCancel: {
+            acknowledgments.withLock { queue in
+                defer { queue.waiter = nil }
+                return queue.waiter
+            }?.resume(returning: false)
+        }
+    }
+
+    private func flushDelayedAcknowledgments(after delay: Duration) async {
+        var streams: [Stream] = []
+        while await waitForDelayedAcknowledgments() {
+            guard (try? await Task.sleep(for: delay, tolerance: delay / 2)) != nil else { return }
+            acknowledgments.withLock { swap(&streams, &$0.streams) }
+            for stream in streams { stream.flushAcknowledgment() }
+            streams.removeAll(keepingCapacity: true)
+        }
     }
     
     @concurrent public func runTimer(_ onTick: @escaping @Sendable (Int) -> Void = { _ in }) async {
@@ -328,6 +390,18 @@ public final class IPStack: Sendable {
             armed.store(0, ordering: .sequentiallyConsistent)
             timerDriver.withLock { $0.running = false }
         }
+        guard let delay = configuration.acknowledgmentDelay else {
+            await runTicks(onTick)
+            return
+        }
+        await withDiscardingTaskGroup { group in
+            group.addTask { await self.flushDelayedAcknowledgments(after: delay) }
+            await runTicks(onTick)
+            group.cancelAll()
+        }
+    }
+
+    private func runTicks(_ onTick: @Sendable (Int) -> Void) async {
         while !Task.isCancelled {
             guard liveGeneration() != nil else { return }
             armed.store(0, ordering: .sequentiallyConsistent)

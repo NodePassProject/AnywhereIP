@@ -37,6 +37,7 @@ final class ControlBlock {
         static let reset = ReceiveFlags(rawValue: 0x08)
         static let closed = ReceiveFlags(rawValue: 0x10)
         static let gotFin = ReceiveFlags(rawValue: 0x20)
+        static let push = ReceiveFlags(rawValue: 0x40)
     }
 
     let source: IPEndpoint
@@ -46,6 +47,9 @@ final class ControlBlock {
     let stack: Context
     let arena: SegmentArena
     let key: ConnectionKey
+    let delaysAcknowledgment: Bool
+    let receiveMSS: Int
+    private(set) var acknowledgmentHeld = false
     var state = State.synReceived
     var flags: Flags = []
     var tmr: UInt32
@@ -82,10 +86,12 @@ final class ControlBlock {
     var isProcessingInput = false
     var closeAfterInput = false
 
-    init(stack: Context, key: ConnectionKey, initialSequenceNumber: UInt32, peerWindow: UInt16, options: UnsafeRawBufferPointer) {
+    init(stack: Context, key: ConnectionKey, initialSequenceNumber: UInt32, peerWindow: UInt16, options: UnsafeRawBufferPointer, delaysAcknowledgment: Bool) {
         self.stack = stack
         arena = stack.arena
         self.key = key
+        self.delaysAcknowledgment = delaysAcknowledgment
+        receiveMSS = min(Int(Constants.maximumSegmentSize), Constants.mtu - (key.local.address.isIPv6 ? IPv6Header.length : IPv4Header.length) - TCPHeader.length)
         source = key.remote
         destination = key.local
         tmr = stack.ticks
@@ -128,6 +134,13 @@ final class ControlBlock {
         rcvWnd = UInt32(min(UInt64(rcvWnd) + UInt64(count), UInt64(windowMax)))
         updateAnnouncedWindow()
         guard announced <= windowMax / 2, rcvAnnWnd > 0, rcvAnnWnd >= announced * 2 else { return }
+        flags.insert(.ackNow)
+        output()
+    }
+
+    func flushHeldAcknowledgment() {
+        guard acknowledgmentHeld else { return }
+        acknowledgmentHeld = false
         flags.insert(.ackNow)
         output()
     }
@@ -318,8 +331,9 @@ final class ControlBlock {
     private func sendEmptyAck(_ stack: Context) {
         let segment = arena.allocate(sequenceNumber: sndNxt, flags: [.ack])
         rcvAnnRightEdge = rcvNxt &+ rcvAnnWnd
-        stack.transmit(segment, from: destination, to: source, acknowledgmentNumber: rcvNxt, window: announcedWindow)
+        stack.transmit(segment, acknowledgmentNumber: rcvNxt, window: announcedWindow)
         flags.remove(.ackNow)
+        acknowledgmentHeld = false
     }
 
     private func transmit(_ segment: Segment, _ stack: Context) {
@@ -332,7 +346,8 @@ final class ControlBlock {
         }
         let window = segment.options.windowScale != nil ? UInt16(min(rcvAnnWnd, 0xFFFF)) : announcedWindow
         rcvAnnRightEdge = rcvNxt &+ rcvAnnWnd
-        stack.transmit(segment, from: destination, to: source, acknowledgmentNumber: rcvNxt, window: window)
+        acknowledgmentHeld = false
+        stack.transmit(segment, acknowledgmentNumber: rcvNxt, window: window)
     }
 
     func output() {
@@ -455,7 +470,8 @@ final class ControlBlock {
             sndNxt = next
         }
         rcvAnnRightEdge = rcvNxt &+ rcvAnnWnd
-        stack.transmit(probe, from: destination, to: source, acknowledgmentNumber: rcvNxt, window: announcedWindow)
+        acknowledgmentHeld = false
+        stack.transmit(probe, acknowledgmentNumber: rcvNxt, window: announcedWindow)
     }
 
     func slowTick(ticks: UInt32) {
@@ -678,7 +694,7 @@ final class ControlBlock {
                 terminate(sendingReset: true, error: nil)
                 return
             }
-            stack.receive(data)
+            stack.receive(data, push: received.contains(.push))
             if state == .closed { return }
         }
         if received.contains(.gotFin) {
@@ -794,6 +810,7 @@ final class ControlBlock {
                     tcpLength = UInt32(dataLength) + (segmentFlags.contains(.syn) || segmentFlags.contains(.fin) ? 1 : 0)
                     if tcpLength > rcvWnd {
                         segmentFlags.remove(.fin)
+                        segmentFlags.remove(.psh)
                         dataLength = Int(rcvWnd)
                         if segmentFlags.contains(.syn) {
                             dataLength -= 1
@@ -805,11 +822,19 @@ final class ControlBlock {
                     updateAnnouncedWindow()
                     if dataLength > 0 {
                         data = UnsafeRawBufferPointer(rebasing: payload[dataOffset..<(dataOffset + dataLength)])
+                        if segmentFlags.contains(.psh) {
+                            received.insert(.push)
+                        }
                     }
                     if segmentFlags.contains(.fin) {
                         received.insert(.gotFin)
                     }
-                    flags.insert(.ackNow)
+                    if delaysAcknowledgment, !acknowledgmentHeld, state == .established, dataLength >= receiveMSS,
+                       segmentFlags.isDisjoint(with: [.psh, .fin]), rcvWnd >= windowMax / 2 {
+                        acknowledgmentHeld = true
+                    } else {
+                        flags.insert(.ackNow)
+                    }
                 } else {
                     sendEmptyAck(stack)
                 }
